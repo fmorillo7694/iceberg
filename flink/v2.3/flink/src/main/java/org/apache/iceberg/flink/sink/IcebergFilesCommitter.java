@@ -24,6 +24,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -125,6 +126,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   private final PartitionSpec spec;
   private boolean indexDvMode = false;
   private Long bootstrapSnapshotId = null;
+  private Set<Integer> equalityFieldIds = null;
   private transient ExecutorService workerPool;
 
   IcebergFilesCommitter(
@@ -144,9 +146,10 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     this.spec = spec;
   }
 
-  void indexDvMode(Long writersBootstrapSnapshotId) {
+  void indexDvMode(Long writersBootstrapSnapshotId, Set<Integer> keyFieldIds) {
     this.indexDvMode = true;
     this.bootstrapSnapshotId = writersBootstrapSnapshotId;
+    this.equalityFieldIds = keyFieldIds;
   }
 
   @Override
@@ -368,14 +371,24 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         // being added in this commit. There is no way for data files added along with the delete
         // files to be concurrently removed, so there is no need to validate the files referenced by
         // the position delete files that are being committed.
+        if (indexDvMode) {
+          IndexDvCommits.commit(
+              table,
+              branch,
+              result,
+              operatorId,
+              bootstrapSnapshotId,
+              equalityFieldIds,
+              rowDelta ->
+                  commitOperation(
+                      rowDelta, summary, "rowDelta", newFlinkJobId, operatorId, e.getKey()));
+          continue;
+        }
+
         RowDelta rowDelta = table.newRowDelta().scanManifestsWith(workerPool);
 
         Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
         Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
-        if (indexDvMode) {
-          IndexDvCommits.prepare(table, branch, rowDelta, result, operatorId, bootstrapSnapshotId);
-        }
-
         commitOperation(rowDelta, summary, "rowDelta", newFlinkJobId, operatorId, e.getKey());
       }
     }

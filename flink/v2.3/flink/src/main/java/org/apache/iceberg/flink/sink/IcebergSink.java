@@ -172,6 +172,8 @@ public class IcebergSink
   // This should only be used for logging/error messages. For any actual logic always use
   // equalityFieldIds instead.
   private final Set<String> equalityFieldColumns;
+  private final boolean indexDvMode;
+  private final Long bootstrapSnapshotId;
 
   private final transient List<MaintenanceTaskBuilder<?>> maintenanceTasks;
   private final transient FlinkMaintenanceConfig flinkMaintenanceConfig;
@@ -214,10 +216,17 @@ public class IcebergSink
     this.maintenanceTasks = maintenanceTasks;
     this.flinkMaintenanceConfig = flinkMaintenanceConfig;
     this.equalityFieldColumns = equalityFieldColumns;
+    this.indexDvMode = flinkWriteConf.upsertIndexDvMode();
+    this.bootstrapSnapshotId =
+        indexDvMode ? IndexDvTopology.bootstrapSnapshotId(table, branch) : null;
   }
 
   @Override
   public SinkWriter<RowData> createWriter(WriterInitContext context) {
+    if (indexDvMode) {
+      return new IndexDvRelayWriter();
+    }
+
     RowDataTaskWriterFactory taskWriterFactory =
         new RowDataTaskWriterFactory(
             tableSupplier,
@@ -251,7 +260,10 @@ public class IcebergSink
         metrics,
         maintenanceEnabled,
         context.getRestoredCheckpointId().isPresent(),
-        context.getTaskInfo().getIndexOfThisSubtask());
+        context.getTaskInfo().getIndexOfThisSubtask(),
+        indexDvMode,
+        bootstrapSnapshotId,
+        equalityFieldIds);
   }
 
   @Override
@@ -309,7 +321,37 @@ public class IcebergSink
 
   @Override
   public DataStream<RowData> addPreWriteTopology(DataStream<RowData> inputDataStream) {
+    if (indexDvMode) {
+      return addIndexDvTopology(inputDataStream);
+    }
+
     return distributeDataStream(inputDataStream);
+  }
+
+  /**
+   * POC: in the index-dv mode the pre-write topology writes the data files and DVs, and the SinkV2
+   * writer only relays their results to the existing aggregator and committer.
+   */
+  private DataStream<RowData> addIndexDvTopology(DataStream<RowData> input) {
+    int parallelism = resolveWriterParallelism(input);
+    IndexDvTopology.validate(flinkWriteConf, table, equalityFieldIds, input, parallelism);
+    String suffix = defaultSuffix(uidSuffix, table.name());
+    return IndexDvTopology.append(
+            input,
+            table,
+            tableLoader,
+            flinkWriteConf,
+            flinkRowType,
+            equalityFieldIds,
+            writeProperties,
+            bootstrapSnapshotId,
+            parallelism,
+            "Sink " + suffix,
+            "sink-" + suffix)
+        .map(new IndexDvRelayWriter.Encoder(), IndexDvRelayWriter.RELAY_TYPE)
+        .name("Sink index-dv relay encoder: " + suffix)
+        .uid("sink-index-dv-relay-encoder-" + suffix)
+        .setParallelism(parallelism);
   }
 
   @Override
@@ -777,9 +819,6 @@ public class IcebergSink
       Set<Integer> equalityFieldIds =
           SinkUtil.checkAndGetEqualityFieldIds(table, equalityFieldColumns);
 
-      Preconditions.checkState(
-          !flinkWriteConf.upsertIndexDvMode(),
-          "POC: upsert-mode 'index-dv' is implemented for FlinkSink only");
       if (flinkWriteConf.upsertMode()) {
         Preconditions.checkState(
             !overwriteMode,

@@ -30,6 +30,7 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.state.CheckpointListener;
 import org.apache.flink.configuration.Configuration;
@@ -47,6 +48,7 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileContent;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
@@ -55,12 +57,16 @@ import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.actions.SizeBasedFileRewritePlanner;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.GenericAppenderHelper;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.flink.FlinkWriteOptions;
 import org.apache.iceberg.flink.HadoopCatalogExtension;
@@ -68,6 +74,9 @@ import org.apache.iceberg.flink.MiniFlinkClusterExtension;
 import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.TestFixtures;
+import org.apache.iceberg.flink.maintenance.api.ExpireSnapshotsConfig;
+import org.apache.iceberg.flink.maintenance.api.FlinkMaintenanceConfig;
+import org.apache.iceberg.flink.maintenance.api.RewriteDataFilesConfig;
 import org.apache.iceberg.flink.source.BoundedTestSource;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -106,6 +115,7 @@ class TestIcebergSinkIndexDv {
   private DistributionMode distributionMode;
 
   @TempDir private Path savepointDir;
+  @TempDir private Path compactionDir;
 
   @Parameters(name = "parallelism={0}, partitioned={1}, distribution={2}")
   static Object[][] parameters() {
@@ -219,9 +229,7 @@ class TestIcebergSinkIndexDv {
             .uid("source");
     sink(input, table, INDEX_DV);
     JobClient job = env.executeAsync("index-dv before rescale");
-    while (!BatchesThenIdleSource.EMITTED_ALL.get()) {
-      Thread.sleep(50);
-    }
+    awaitOrFail(job, BatchesThenIdleSource.EMITTED_ALL::get);
 
     String savepoint =
         job.stopWithSavepoint(false, savepointDir.toString(), SavepointFormatType.CANONICAL)
@@ -236,7 +244,7 @@ class TestIcebergSinkIndexDv {
         restoredEnv
             .addSource(new BoundedTestSource<>(second), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
             .uid("source");
-    sink(restoredInput, table, INDEX_DV, rescaled);
+    sink(restoredInput, table, INDEX_DV, rescaled, ImmutableMap.of(), false);
     restoredEnv.execute("index-dv after rescale");
 
     Map<Integer, String> state = Maps.newHashMap();
@@ -245,6 +253,220 @@ class TestIcebergSinkIndexDv {
     assertThat(IndexDvDataWriter.BOOTSTRAPPED_KEYS.get()).isZero();
     assertThat(writerSubtasksOfLiveFiles(table)).contains(rescaled - 1);
     assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+  }
+
+  @TestTemplate
+  void flinkSinkVariantMatchesModel() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
+    List<List<Row>> batches = randomChangelog(5, 40, 25, 31);
+    Table table = createTable("t_dv");
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism);
+    DataStream<Row> input =
+        env.addSource(new BoundedTestSource<>(batches), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO);
+    sink(input, table, INDEX_DV, parallelism, ImmutableMap.of(), true);
+    env.execute("index-dv FlinkSink variant");
+
+    assertThat(liveRows(table))
+        .containsExactlyInAnyOrderElementsOf(applyUpserts(Maps.newHashMap(), batches));
+    assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+  }
+
+  @TestTemplate
+  void inJobRewriteKeepsIndexCorrect() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
+    runWithInJobMaintenance(maintenanceOptions(false), 61);
+  }
+
+  @TestTemplate
+  void inJobRewriteExpireAndConverterTogether() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
+    assumeThat(partitioned).isFalse();
+    runWithInJobMaintenance(maintenanceOptions(true), 62);
+  }
+
+  @TestTemplate
+  void externalCompactionBetweenCheckpoints() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
+    assumeThat(partitioned).isFalse();
+    List<List<Row>> batches = randomChangelog(6, 60, 30, 71);
+    Table table = createTable("t_dv");
+    IndexDvCommits.REBASED_DVS.set(0);
+
+    PacedSource.reset(ImmutableList.of(1, 3));
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism, false);
+    DataStream<Row> input =
+        env.addSource(new PacedSource(batches, 2), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO);
+    sink(input, table, INDEX_DV);
+    JobClient job = env.executeAsync("index-dv external compaction");
+    try {
+      for (int batch : ImmutableList.of(1, 3)) {
+        int pausedBatch = batch;
+        awaitOrFail(job, () -> PacedSource.PAUSED_AT.get() == pausedBatch);
+        compactAll(table);
+        PacedSource.resume(batch);
+      }
+
+      job.getJobExecutionResult().get(120, TimeUnit.SECONDS);
+    } finally {
+      if (!job.getJobStatus().get().isTerminalState()) {
+        job.cancel().get();
+      }
+    }
+
+    assertThat(liveRows(table))
+        .containsExactlyInAnyOrderElementsOf(applyUpserts(Maps.newHashMap(), batches));
+    assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+    System.out.printf(
+        "COMPACTION external rebasedDvs=%d retries=%d rewritesApplied=%d%n",
+        IndexDvCommits.REBASED_DVS.get(),
+        IndexDvCommits.RETRIES.get(),
+        IndexDvDataWriter.REWRITES_APPLIED.get());
+  }
+
+  @TestTemplate
+  void savepointRestoreAfterCompaction() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
+    assumeThat(partitioned).isFalse();
+    List<List<Row>> first = randomChangelog(3, 60, 40, 81);
+    List<List<Row>> second = randomChangelog(3, 60, 40, 82);
+    Table table = createTable("t_dv");
+
+    BatchesThenIdleSource.EMITTED_ALL.set(false);
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism, false);
+    DataStream<Row> input =
+        env.addSource(new BatchesThenIdleSource(first), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(input, table, INDEX_DV);
+    JobClient job = env.executeAsync("index-dv before compaction");
+    awaitOrFail(job, BatchesThenIdleSource.EMITTED_ALL::get);
+
+    String savepoint =
+        job.stopWithSavepoint(false, savepointDir.toString(), SavepointFormatType.CANONICAL)
+            .get(60, TimeUnit.SECONDS);
+    compactAll(table);
+
+    Configuration restore = new Configuration();
+    restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
+    StreamExecutionEnvironment restoredEnv = environment(restore, parallelism, false);
+    DataStream<Row> restoredInput =
+        restoredEnv
+            .addSource(new BoundedTestSource<>(second), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(restoredInput, table, INDEX_DV);
+    restoredEnv.execute("index-dv after compaction");
+
+    Map<Integer, String> state = Maps.newHashMap();
+    applyUpserts(state, first);
+    assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(applyUpserts(state, second));
+    assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+  }
+
+  private void runWithInJobMaintenance(Map<String, String> options, long seed) throws Exception {
+    List<List<Row>> batches = randomChangelog(8, 60, 30, seed);
+    Table table = createTable("t_dv");
+    IndexDvCommits.REBASED_DVS.set(0);
+    IndexDvCommits.RETRIES.set(0);
+    IndexDvDataWriter.REWRITES_APPLIED.set(0);
+
+    PacedSource.reset(ImmutableList.of());
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism, false);
+    DataStream<Row> input =
+        env.addSource(new PacedSource(batches, 12), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO);
+    sink(input, table, INDEX_DV, parallelism, options, false);
+    env.execute("index-dv with in-job maintenance");
+
+    table.refresh();
+    long rewrites =
+        Lists.newArrayList(table.snapshots()).stream()
+            .filter(snapshot -> "replace".equals(snapshot.operation()))
+            .count();
+    System.out.printf(
+        "COMPACTION inJob partitioned=%s options=%s rewriteCommits=%d rebasedDvs=%d retries=%d "
+            + "rewritesApplied=%d snapshots=%d%n",
+        partitioned,
+        options.keySet(),
+        rewrites,
+        IndexDvCommits.REBASED_DVS.get(),
+        IndexDvCommits.RETRIES.get(),
+        IndexDvDataWriter.REWRITES_APPLIED.get(),
+        Lists.newArrayList(table.snapshots()).size());
+    assertThat(rewrites).isPositive();
+    assertThat(liveRows(table))
+        .containsExactlyInAnyOrderElementsOf(applyUpserts(Maps.newHashMap(), batches));
+    assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+  }
+
+  private static Map<String, String> maintenanceOptions(boolean allTasks) {
+    Map<String, String> options = Maps.newHashMap();
+    options.put(FlinkWriteOptions.COMPACTION_ENABLE.key(), "true");
+    options.put(RewriteDataFilesConfig.SCHEDULE_ON_COMMIT_COUNT, "1");
+    options.put(RewriteDataFilesConfig.PREFIX + SizeBasedFileRewritePlanner.REWRITE_ALL, "true");
+    options.put(FlinkMaintenanceConfig.RATE_LIMIT, "1");
+    options.put(FlinkMaintenanceConfig.LOCK_CHECK_DELAY, "1");
+    if (allTasks) {
+      options.put(FlinkWriteOptions.EXPIRE_SNAPSHOTS_ENABLE.key(), "true");
+      options.put(ExpireSnapshotsConfig.SCHEDULE_ON_COMMIT_COUNT, "3");
+      options.put(ExpireSnapshotsConfig.RETAIN_LAST, "5");
+      options.put(FlinkWriteOptions.CONVERT_EQUALITY_DELETES_ENABLE.key(), "true");
+    }
+
+    return options;
+  }
+
+  /**
+   * Rewrites all live rows of an unpartitioned table into one data file, like a compaction,
+   * retrying when a concurrent sink commit adds deletes to the files being rewritten.
+   */
+  private void compactAll(Table table) throws IOException {
+    for (int attempt = 1; ; attempt++) {
+      try {
+        compactOnce(table);
+        return;
+      } catch (ValidationException e) {
+        if (attempt >= 5) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  private static void awaitOrFail(JobClient job, BooleanSupplier condition) throws Exception {
+    while (!condition.getAsBoolean()) {
+      if (job.getJobStatus().get().isTerminalState()) {
+        job.getJobExecutionResult().get();
+        throw new IllegalStateException("Job ended before the expected condition");
+      }
+
+      Thread.sleep(50);
+    }
+  }
+
+  private void compactOnce(Table table) throws IOException {
+    table.refresh();
+    Snapshot head = table.currentSnapshot();
+    List<Record> live = Lists.newArrayList();
+    try (CloseableIterable<Record> records =
+        IcebergGenerics.read(table).useSnapshot(head.snapshotId()).build()) {
+      records.forEach(record -> live.add(record.copy()));
+    }
+
+    RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(head.snapshotId());
+    try (CloseableIterable<FileScanTask> tasks =
+        table.newScan().useSnapshot(head.snapshotId()).planFiles()) {
+      for (FileScanTask task : tasks) {
+        rewrite.deleteFile(task.file());
+      }
+    }
+
+    rewrite
+        .addFile(
+            new GenericAppenderHelper(table, FileFormat.PARQUET, compactionDir).writeFile(live))
+        .commit();
   }
 
   @TestTemplate
@@ -306,10 +528,20 @@ class TestIcebergSinkIndexDv {
   }
 
   private StreamExecutionEnvironment environment(Configuration extra, int envParallelism) {
+    return environment(extra, envParallelism, true);
+  }
+
+  private StreamExecutionEnvironment environment(
+      Configuration extra, int envParallelism, boolean restartOnce) {
     Configuration config =
         new Configuration(MiniFlinkClusterExtension.DISABLE_CLASSLOADER_CHECK_CONFIG);
-    config.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
-    config.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
+    if (restartOnce) {
+      config.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
+      config.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
+    } else {
+      config.set(RestartStrategyOptions.RESTART_STRATEGY, "none");
+    }
+
     config.addAll(extra);
     return StreamExecutionEnvironment.getExecutionEnvironment(config)
         .enableCheckpointing(100L)
@@ -332,23 +564,41 @@ class TestIcebergSinkIndexDv {
   }
 
   private void sink(DataStream<Row> input, Table table, String upsertMode) {
-    sink(input, table, upsertMode, parallelism);
+    sink(input, table, upsertMode, parallelism, ImmutableMap.of(), false);
   }
 
   private static void sink(
-      DataStream<Row> input, Table table, String upsertMode, int writeParallelism) {
+      DataStream<Row> input,
+      Table table,
+      String upsertMode,
+      int writeParallelism,
+      Map<String, String> options,
+      boolean useFlinkSink) {
     TableLoader tableLoader =
         TableLoader.fromCatalog(
             CATALOG_EXTENSION.catalogLoader(), TableIdentifier.of(DATABASE, tableName(table)));
-    FlinkSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
-        .tableLoader(tableLoader)
-        .resolvedSchema(SimpleDataUtil.FLINK_SCHEMA)
-        .writeParallelism(writeParallelism)
-        .equalityFieldColumns(ImmutableList.of("id"))
-        .upsert(true)
-        .uidPrefix("sink")
-        .set(FlinkWriteOptions.UPSERT_MODE.key(), upsertMode)
-        .append();
+    if (useFlinkSink) {
+      FlinkSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
+          .tableLoader(tableLoader)
+          .resolvedSchema(SimpleDataUtil.FLINK_SCHEMA)
+          .writeParallelism(writeParallelism)
+          .equalityFieldColumns(ImmutableList.of("id"))
+          .upsert(true)
+          .uidPrefix("sink")
+          .set(FlinkWriteOptions.UPSERT_MODE.key(), upsertMode)
+          .setAll(options)
+          .append();
+    } else {
+      IcebergSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
+          .tableLoader(tableLoader)
+          .writeParallelism(writeParallelism)
+          .equalityFieldColumns(ImmutableList.of("id"))
+          .upsert(true)
+          .uidSuffix("sink")
+          .set(FlinkWriteOptions.UPSERT_MODE.key(), upsertMode)
+          .setAll(options)
+          .append();
+    }
   }
 
   private static String tableName(Table table) {
@@ -466,6 +716,67 @@ class TestIcebergSinkIndexDv {
           default -> throw new IllegalArgumentException("Unknown row kind: " + kind);
         };
     return Row.ofKind(rowKind, id, data);
+  }
+
+  /**
+   * Emits each batch after the given number of completed checkpoints, optionally pausing after
+   * chosen batches until the test resumes it, then finishes.
+   */
+  private static class PacedSource implements SourceFunction<Row>, CheckpointListener {
+    private static final AtomicInteger PAUSED_AT = new AtomicInteger(-1);
+    private static final AtomicInteger RESUMED_AT = new AtomicInteger(-1);
+    private static volatile List<Integer> pauseAfter = ImmutableList.of();
+
+    private final List<List<Row>> batches;
+    private final int checkpointsBetweenBatches;
+    private final AtomicInteger completedCheckpoints = new AtomicInteger();
+    private volatile boolean running = true;
+
+    PacedSource(List<List<Row>> batches, int checkpointsBetweenBatches) {
+      this.batches = batches;
+      this.checkpointsBetweenBatches = checkpointsBetweenBatches;
+    }
+
+    static void reset(List<Integer> batchesToPauseAfter) {
+      PAUSED_AT.set(-1);
+      RESUMED_AT.set(-1);
+      pauseAfter = batchesToPauseAfter;
+    }
+
+    static void resume(int batch) {
+      RESUMED_AT.set(batch);
+    }
+
+    @Override
+    public void run(SourceContext<Row> ctx) throws Exception {
+      for (int b = 0; b < batches.size() && running; b++) {
+        synchronized (ctx.getCheckpointLock()) {
+          batches.get(b).forEach(ctx::collect);
+        }
+
+        int target = completedCheckpoints.get() + checkpointsBetweenBatches;
+        while (running && completedCheckpoints.get() < target) {
+          Thread.sleep(10);
+        }
+
+        if (pauseAfter.contains(b)) {
+          PAUSED_AT.set(b);
+          while (running && RESUMED_AT.get() != b) {
+            Thread.sleep(10);
+          }
+        }
+      }
+    }
+
+    @Override
+    public void cancel() {
+      this.running = false;
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) {
+      completedCheckpoints.incrementAndGet();
+    }
   }
 
   /** Fails the job once, after the given number of records, to force a restore. */

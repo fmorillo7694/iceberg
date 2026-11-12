@@ -47,6 +47,7 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.OutputTag;
 import org.apache.iceberg.Accessor;
 import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -55,6 +56,8 @@ import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotChanges;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.GenericDeleteFilter;
@@ -73,8 +76,10 @@ import org.apache.iceberg.io.RollingDataWriter;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.util.ContentFileUtil;
@@ -101,8 +106,10 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
 
   @VisibleForTesting static final AtomicLong LAST_BOOTSTRAP_MILLIS = new AtomicLong(-1);
   @VisibleForTesting static final AtomicLong BOOTSTRAPPED_KEYS = new AtomicLong();
+  @VisibleForTesting static final AtomicLong REWRITES_APPLIED = new AtomicLong();
 
   private final TableLoader tableLoader;
+  private final String branch;
   private final RowType flinkRowType;
   private final Set<Integer> equalityFieldIds;
   private final FileFormat format;
@@ -121,6 +128,8 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
 
   private transient ValueState<Long> location;
   private transient ListState<byte[]> fileDictionaryState;
+  private transient ListState<Long> lastSeenSnapshotState;
+  private transient Long lastSeenSnapshotId;
   private transient Map<Integer, FileEntry> files;
   private transient Map<String, Integer> fileIds;
   private transient int subtaskIndex;
@@ -159,6 +168,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
 
   IndexDvDataWriter(
       TableLoader tableLoader,
+      String branch,
       RowType flinkRowType,
       Set<Integer> equalityFieldIds,
       FileFormat format,
@@ -166,6 +176,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
       Map<String, String> writeProperties,
       Long bootstrapSnapshotId) {
     this.tableLoader = tableLoader;
+    this.branch = branch;
     this.flinkRowType = flinkRowType;
     this.equalityFieldIds = equalityFieldIds;
     this.format = format;
@@ -226,8 +237,22 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     }
 
     this.nextFileCounter = maxCounter + 1;
+    for (FileEntry entry : files.values()) {
+      fileIds.put(entry.path(), entry.id());
+    }
+
+    this.lastSeenSnapshotState =
+        context
+            .getOperatorStateStore()
+            .getUnionListState(new ListStateDescriptor<>("index-dv-last-seen", Types.LONG));
+    for (Long seen : lastSeenSnapshotState.get()) {
+      // Re-applying a rewrite is harmless, so after a rescale resume from the oldest subtask view.
+      lastSeenSnapshotId = lastSeenSnapshotId == null ? seen : Math.min(lastSeenSnapshotId, seen);
+    }
+
     if (!context.isRestored()) {
       bootstrap();
+      this.lastSeenSnapshotId = bootstrapSnapshotId;
     }
   }
 
@@ -313,19 +338,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     }
 
     long start = System.currentTimeMillis();
-    Schema keySchema = TypeUtil.select(table.schema(), equalityFieldIds);
-    List<NestedField> columns = Lists.newArrayList(keySchema.columns());
-    columns.add(MetadataColumns.ROW_POSITION);
-    Schema requested = new Schema(columns);
-    InternalRecordWrapper keyWrapper = new InternalRecordWrapper(keySchema.asStruct());
-    int maxParallelism = getRuntimeContext().getTaskInfo().getMaxNumberOfParallelSubtasks();
-    KeyGroupRange ownedKeyGroups =
-        KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(
-            maxParallelism,
-            getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks(),
-            getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
-    long keys = 0;
-
+    long[] keys = {0};
     try (CloseableIterable<FileScanTask> tasks =
         table.newScan().useSnapshot(bootstrapSnapshotId).planFiles()) {
       for (FileScanTask task : tasks) {
@@ -338,42 +351,146 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
         }
 
         int fileId = register(file.location(), table.specs().get(file.specId()), file.partition());
-        GenericDeleteFilter filter =
-            new GenericDeleteFilter(table.io(), task, table.schema(), requested);
-        Schema readSchema = filter.requiredSchema();
-        StructProjection keyProjection = StructProjection.create(readSchema, keySchema);
-        Accessor<StructLike> posAccessor =
-            readSchema.accessorForField(MetadataColumns.ROW_POSITION.fieldId());
-        CloseableIterable<Record> records =
-            FormatModelRegistry.<Record, Schema>readBuilder(
-                    file.format(), Record.class, table.io().newInputFile(file.location()))
-                .project(readSchema)
-                .build();
-        try (CloseableIterable<Record> live = filter.filter(records)) {
-          for (Record record : live) {
-            SerializedEqualityValues key =
-                serializer.serializeKey(
-                    keyWrapper.wrap(keyProjection.wrap(record)), keySchema.asStruct());
-            if (ownedKeyGroups.contains(
-                KeyGroupRangeAssignment.assignToKeyGroup(key, maxParallelism))) {
-              getKeyedStateBackend().setCurrentKey(key);
-              location.update(pack(fileId, (long) posAccessor.get(record)));
-              keys++;
-            }
-          }
-        }
+        forEachOwnedKey(
+            file,
+            task,
+            (key, pos) -> {
+              location.update(pack(fileId, pos));
+              keys[0]++;
+            });
       }
     }
 
     long millis = System.currentTimeMillis() - start;
     LAST_BOOTSTRAP_MILLIS.accumulateAndGet(millis, Math::max);
-    BOOTSTRAPPED_KEYS.addAndGet(keys);
-    LOG.info("Bootstrapped {} keys on subtask {} in {} ms", keys, subtaskIndex, millis);
+    BOOTSTRAPPED_KEYS.addAndGet(keys[0]);
+    LOG.info("Bootstrapped {} keys on subtask {} in {} ms", keys[0], subtaskIndex, millis);
+  }
+
+  /**
+   * Visits the keys this subtask owns in a data file with their positions, as the current key of
+   * the keyed state. With a scan task, rows deleted in that task are skipped.
+   */
+  private void forEachOwnedKey(DataFile file, FileScanTask task, KeyPositionConsumer consumer)
+      throws IOException {
+    Schema keySchema = TypeUtil.select(table.schema(), equalityFieldIds);
+    List<NestedField> columns = Lists.newArrayList(keySchema.columns());
+    columns.add(MetadataColumns.ROW_POSITION);
+    Schema requested = new Schema(columns);
+    InternalRecordWrapper keyWrapper = new InternalRecordWrapper(keySchema.asStruct());
+    int maxParallelism = getRuntimeContext().getTaskInfo().getMaxNumberOfParallelSubtasks();
+    KeyGroupRange ownedKeyGroups =
+        KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(
+            maxParallelism,
+            getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks(),
+            subtaskIndex);
+
+    GenericDeleteFilter filter =
+        task != null ? new GenericDeleteFilter(table.io(), task, table.schema(), requested) : null;
+    Schema readSchema = filter != null ? filter.requiredSchema() : requested;
+    StructProjection keyProjection = StructProjection.create(readSchema, keySchema);
+    Accessor<StructLike> posAccessor =
+        readSchema.accessorForField(MetadataColumns.ROW_POSITION.fieldId());
+    CloseableIterable<Record> records =
+        FormatModelRegistry.<Record, Schema>readBuilder(
+                file.format(), Record.class, table.io().newInputFile(file.location()))
+            .project(readSchema)
+            .build();
+    try (CloseableIterable<Record> rows = filter != null ? filter.filter(records) : records) {
+      for (Record record : rows) {
+        SerializedEqualityValues key =
+            serializer.serializeKey(
+                keyWrapper.wrap(keyProjection.wrap(record)), keySchema.asStruct());
+        if (ownedKeyGroups.contains(
+            KeyGroupRangeAssignment.assignToKeyGroup(key, maxParallelism))) {
+          getKeyedStateBackend().setCurrentKey(key);
+          consumer.accept(key, (long) posAccessor.get(record));
+        }
+      }
+    }
+  }
+
+  @FunctionalInterface
+  private interface KeyPositionConsumer {
+    void accept(SerializedEqualityValues key, long pos) throws IOException;
+  }
+
+  /**
+   * Moves keys whose row a rewrite (compaction) carried into a new data file to that file, so later
+   * updates delete the live copy. Keys updated since the rewrite already point elsewhere and stay.
+   */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
+  private void applyRewrites() throws IOException {
+    table.refresh();
+    Snapshot head = table.snapshot(branch);
+    if (head == null || lastSeenSnapshotId == null || head.snapshotId() == lastSeenSnapshotId) {
+      this.lastSeenSnapshotId = head != null ? head.snapshotId() : null;
+      return;
+    }
+
+    List<Snapshot> newer = Lists.newArrayList();
+    for (Snapshot snapshot = head;
+        snapshot != null && snapshot.snapshotId() != lastSeenSnapshotId;
+        snapshot = snapshot.parentId() == null ? null : table.snapshot(snapshot.parentId())) {
+      newer.add(0, snapshot);
+    }
+
+    for (Snapshot snapshot : newer) {
+      if (!DataOperations.REPLACE.equals(snapshot.operation())) {
+        continue;
+      }
+
+      SnapshotChanges changes = SnapshotChanges.builderFor(table).snapshot(snapshot).build();
+      Set<Integer> removed = Sets.newHashSet();
+      for (DataFile file : changes.removedDataFiles()) {
+        Integer id = fileIds.get(file.location());
+        if (id != null) {
+          removed.add(id);
+        }
+      }
+
+      if (removed.isEmpty()) {
+        continue;
+      }
+
+      long moved = 0;
+      for (DataFile file : changes.addedDataFiles()) {
+        int fileId =
+            fileIds.containsKey(file.location())
+                ? fileIds.get(file.location())
+                : register(file.location(), table.specs().get(file.specId()), file.partition());
+        long[] count = {0};
+        forEachOwnedKey(
+            file,
+            null,
+            (key, pos) -> {
+              Long current = location.value();
+              if (current != null && removed.contains((int) (current >>> 32))) {
+                location.update(pack(fileId, pos));
+                count[0]++;
+              }
+            });
+        moved += count[0];
+      }
+
+      REWRITES_APPLIED.incrementAndGet();
+      LOG.info(
+          "Applied rewrite snapshot {} on subtask {}: moved {} keys",
+          snapshot.snapshotId(),
+          subtaskIndex,
+          moved);
+    }
+
+    this.lastSeenSnapshotId = head.snapshotId();
   }
 
   @Override
   public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
     super.prepareSnapshotPreBarrier(checkpointId);
+    if (!inputEnded) {
+      applyRewrites();
+    }
+
     flush(checkpointId);
   }
 
@@ -387,6 +504,8 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     }
 
     fileDictionaryState.update(encoded);
+    lastSeenSnapshotState.update(
+        lastSeenSnapshotId != null ? ImmutableList.of(lastSeenSnapshotId) : ImmutableList.of());
   }
 
   @Override
@@ -407,7 +526,6 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     }
 
     dataWriters.clear();
-    fileIds.clear();
     output.collect(
         new StreamRecord<>(
             new FlinkWriteResult(

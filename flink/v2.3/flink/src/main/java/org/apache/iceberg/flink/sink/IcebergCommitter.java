@@ -24,6 +24,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.connector.sink2.Committer;
@@ -81,6 +82,9 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
   private final boolean tableMaintenanceEnabled;
   private final boolean isRestored;
   private final int subtaskId;
+  private final boolean indexDvMode;
+  private final Long bootstrapSnapshotId;
+  private final Set<Integer> equalityFieldIds;
 
   IcebergCommitter(
       TableLoader tableLoader,
@@ -93,7 +97,41 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
       boolean tableMaintenanceEnabled,
       boolean isRestored,
       int subtaskId) {
+    this(
+        tableLoader,
+        branch,
+        snapshotProperties,
+        replacePartitions,
+        workerPoolSize,
+        sinkId,
+        committerMetrics,
+        tableMaintenanceEnabled,
+        isRestored,
+        subtaskId,
+        false,
+        null,
+        null);
+  }
+
+  @SuppressWarnings("checkstyle:ParameterNumber")
+  IcebergCommitter(
+      TableLoader tableLoader,
+      String branch,
+      Map<String, String> snapshotProperties,
+      boolean replacePartitions,
+      int workerPoolSize,
+      String sinkId,
+      IcebergFilesCommitterMetrics committerMetrics,
+      boolean tableMaintenanceEnabled,
+      boolean isRestored,
+      int subtaskId,
+      boolean indexDvMode,
+      Long bootstrapSnapshotId,
+      Set<Integer> equalityFieldIds) {
     this.branch = branch;
+    this.indexDvMode = indexDvMode;
+    this.bootstrapSnapshotId = bootstrapSnapshotId;
+    this.equalityFieldIds = equalityFieldIds;
     this.snapshotProperties = snapshotProperties;
     this.replacePartitions = replacePartitions;
     this.committerMetrics = committerMetrics;
@@ -297,6 +335,22 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
         // being added in this commit. There is no way for data files added along with the delete
         // files to be concurrently removed, so there is no need to validate the files referenced by
         // the position delete files that are being committed.
+        if (indexDvMode) {
+          String indexDvDescription = "rowDelta";
+          logCommitSummary(summary, indexDvDescription);
+          IndexDvCommits.commit(
+              table,
+              branch,
+              result,
+              operatorId,
+              bootstrapSnapshotId,
+              equalityFieldIds,
+              rowDelta ->
+                  commitOperation(
+                      rowDelta, indexDvDescription, newFlinkJobId, operatorId, e.getKey()));
+          continue;
+        }
+
         RowDelta rowDelta = table.newRowDelta().scanManifestsWith(workerPool);
 
         Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);

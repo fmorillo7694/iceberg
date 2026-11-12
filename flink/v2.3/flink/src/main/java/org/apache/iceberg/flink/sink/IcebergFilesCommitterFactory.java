@@ -19,6 +19,7 @@
 package org.apache.iceberg.flink.sink;
 
 import java.util.Map;
+import java.util.Set;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperator;
@@ -37,6 +38,7 @@ class IcebergFilesCommitterFactory
   private final PartitionSpec spec;
   private boolean indexDvMode = false;
   private Long bootstrapSnapshotId = null;
+  private Set<Integer> equalityFieldIds = null;
 
   IcebergFilesCommitterFactory(
       TableLoader tableLoader,
@@ -54,9 +56,11 @@ class IcebergFilesCommitterFactory
   }
 
   /** POC: commits for the index-dv upsert mode, see {@link IndexDvCommits}. */
-  IcebergFilesCommitterFactory indexDvMode(Long writersBootstrapSnapshotId) {
+  IcebergFilesCommitterFactory indexDvMode(
+      Long writersBootstrapSnapshotId, Set<Integer> keyFieldIds) {
     this.indexDvMode = true;
     this.bootstrapSnapshotId = writersBootstrapSnapshotId;
+    this.equalityFieldIds = keyFieldIds;
     return this;
   }
 
@@ -72,7 +76,7 @@ class IcebergFilesCommitterFactory
             branch,
             spec);
     if (indexDvMode) {
-      committer.indexDvMode(bootstrapSnapshotId);
+      committer.indexDvMode(bootstrapSnapshotId, equalityFieldIds);
     }
 
     return committer;
