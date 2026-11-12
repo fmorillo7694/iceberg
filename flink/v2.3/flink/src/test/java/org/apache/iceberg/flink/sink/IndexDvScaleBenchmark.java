@@ -283,14 +283,25 @@ class IndexDvScaleBenchmark {
         env.addSource(
                 new UpdatePhasesSource(keys, updates), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
             .setParallelism(1);
-    FlinkSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
-        .tableLoader(loader(name))
-        .resolvedSchema(SimpleDataUtil.FLINK_SCHEMA)
-        .writeParallelism(PARALLELISM)
-        .equalityFieldColumns(ImmutableList.of("id"))
-        .upsert(true)
-        .set(FlinkWriteOptions.UPSERT_MODE.key(), mode)
-        .append();
+    if ("iceberg".equals(System.getenv("INDEX_DV_BENCH_SINK"))) {
+      IcebergSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
+          .tableLoader(loader(name))
+          .writeParallelism(PARALLELISM)
+          .equalityFieldColumns(ImmutableList.of("id"))
+          .upsert(true)
+          .set(FlinkWriteOptions.UPSERT_MODE.key(), mode)
+          .append();
+    } else {
+      FlinkSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
+          .tableLoader(loader(name))
+          .resolvedSchema(SimpleDataUtil.FLINK_SCHEMA)
+          .writeParallelism(PARALLELISM)
+          .equalityFieldColumns(ImmutableList.of("id"))
+          .upsert(true)
+          .set(FlinkWriteOptions.UPSERT_MODE.key(), mode)
+          .append();
+    }
+
     JobClient job = env.executeAsync("upserts " + name);
     job.getJobExecutionResult().get();
     return job.getJobID();
