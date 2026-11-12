@@ -123,6 +123,8 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
   private final Integer workerPoolSize;
   private final PartitionSpec spec;
+  private boolean indexDvMode = false;
+  private Long bootstrapSnapshotId = null;
   private transient ExecutorService workerPool;
 
   IcebergFilesCommitter(
@@ -140,6 +142,11 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     this.workerPoolSize = workerPoolSize;
     this.branch = branch;
     this.spec = spec;
+  }
+
+  void indexDvMode(Long writersBootstrapSnapshotId) {
+    this.indexDvMode = true;
+    this.bootstrapSnapshotId = writersBootstrapSnapshotId;
   }
 
   @Override
@@ -365,6 +372,10 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
         Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
         Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
+        if (indexDvMode) {
+          IndexDvCommits.prepare(table, branch, rowDelta, result, operatorId, bootstrapSnapshotId);
+        }
+
         commitOperation(rowDelta, summary, "rowDelta", newFlinkJobId, operatorId, e.getKey());
       }
     }
@@ -450,6 +461,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
             result,
             () -> manifestOutputFileFactory.create(checkpointId),
             spec,
+            table.specs(),
             TableUtil.formatVersion(table));
 
     return SimpleVersionedSerialization.writeVersionAndSerialize(

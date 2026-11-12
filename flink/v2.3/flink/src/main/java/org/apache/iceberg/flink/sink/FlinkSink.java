@@ -53,12 +53,16 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Partitioning;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SerializableTable;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.FlinkWriteOptions;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.maintenance.operator.DVPosition;
+import org.apache.iceberg.flink.maintenance.operator.SerializedEqualityValues;
 import org.apache.iceberg.flink.sink.shuffle.DataStatisticsOperatorFactory;
 import org.apache.iceberg.flink.sink.shuffle.RangePartitioner;
 import org.apache.iceberg.flink.sink.shuffle.StatisticsOrRecord;
@@ -461,6 +465,12 @@ public class FlinkSink {
               ? rowDataInput.getParallelism()
               : flinkWriteConf.writeParallelism();
 
+      if (flinkWriteConf.upsertIndexDvMode()) {
+        return appendDummySink(
+            appendIndexDvOperators(
+                rowDataInput, equalityFieldIds, flinkRowType, writerParallelism));
+      }
+
       // Distribute the records from input data stream based on the write.distribution-mode and
       // equality fields.
       DataStream<RowData> distributeStream =
@@ -532,16 +542,101 @@ public class FlinkSink {
       return resultStream;
     }
 
+    /**
+     * POC: upsert topology for the index-dv mode. Rows are keyed by their equality key, so the
+     * operator that owns a key's location also writes its new row; retired positions are keyed by
+     * data file and written as deletion vectors.
+     */
+    private SingleOutputStreamOperator<Void> appendIndexDvOperators(
+        DataStream<RowData> input,
+        Set<Integer> equalityFieldIds,
+        RowType flinkRowType,
+        int writerParallelism) {
+      Preconditions.checkState(
+          flinkWriteConf.upsertMode(), "POC: upsert-mode 'index-dv' requires upsert enabled");
+      Preconditions.checkState(
+          !flinkWriteConf.overwriteMode(), "Upsert mode 'index-dv' can't be used with overwrite");
+      Preconditions.checkState(
+          !equalityFieldIds.isEmpty(), "Upsert mode 'index-dv' requires equality field columns");
+      Preconditions.checkState(
+          TableUtil.formatVersion(table) >= 3,
+          "Upsert mode 'index-dv' requires format version 3 or later, table %s is version %s",
+          table.name(),
+          TableUtil.formatVersion(table));
+
+      DistributionMode mode = flinkWriteConf.distributionMode();
+      if (mode == DistributionMode.HASH && table.spec().isPartitioned()) {
+        LOG.warn(
+            "Upsert mode 'index-dv' distributes rows by equality fields, not by partition: each of "
+                + "the {} writers can write a file for every partition in each checkpoint",
+            writerParallelism);
+      } else if (mode == DistributionMode.RANGE) {
+        LOG.warn("Upsert mode 'index-dv' distributes rows by equality fields, not by range");
+      }
+
+      Snapshot head = table.snapshot(flinkWriteConf.branch());
+      Long bootstrapSnapshotId = head != null ? head.snapshotId() : null;
+
+      SingleOutputStreamOperator<FlinkWriteResult> dataStream =
+          input
+              .keyBy(
+                  new IndexDvKeySelector(table.schema(), flinkRowType, equalityFieldIds),
+                  TypeInformation.of(SerializedEqualityValues.class))
+              .transform(
+                  operatorName(ICEBERG_STREAM_WRITER_NAME),
+                  TypeInformation.of(FlinkWriteResult.class),
+                  new IndexDvDataWriter(
+                      tableLoader,
+                      flinkRowType,
+                      equalityFieldIds,
+                      flinkWriteConf.dataFileFormat(),
+                      flinkWriteConf.targetDataFileSize(),
+                      SinkUtil.writeProperties(
+                          flinkWriteConf.dataFileFormat(), flinkWriteConf, table),
+                      bootstrapSnapshotId))
+              .setParallelism(writerParallelism);
+      SingleOutputStreamOperator<FlinkWriteResult> dvStream =
+          dataStream
+              .getSideOutput(IndexDvDataWriter.DELETES)
+              .keyBy(DVPosition::dataFilePath)
+              .transform(
+                  operatorName("IcebergIndexDvDeleteWriter"),
+                  TypeInformation.of(FlinkWriteResult.class),
+                  new IndexDvDeleteWriter(tableLoader, bootstrapSnapshotId))
+              .setParallelism(writerParallelism);
+      if (uidPrefix != null) {
+        dataStream = dataStream.uid(uidPrefix + "-writer");
+        dvStream = dvStream.uid(uidPrefix + "-dv-writer");
+      }
+
+      return appendCommitter(
+          dataStream.union(dvStream),
+          new IcebergFilesCommitterFactory(
+                  tableLoader,
+                  false,
+                  snapshotProperties,
+                  flinkWriteConf.workerPoolSize(),
+                  flinkWriteConf.branch(),
+                  table.spec())
+              .indexDvMode(bootstrapSnapshotId));
+    }
+
     private SingleOutputStreamOperator<Void> appendCommitter(
         SingleOutputStreamOperator<FlinkWriteResult> writerStream) {
-      OneInputStreamOperatorFactory<FlinkWriteResult, Void> filesCommitterFactory =
+      return appendCommitter(
+          writerStream,
           new IcebergFilesCommitterFactory(
               tableLoader,
               flinkWriteConf.overwriteMode(),
               snapshotProperties,
               flinkWriteConf.workerPoolSize(),
               flinkWriteConf.branch(),
-              table.spec());
+              table.spec()));
+    }
+
+    private SingleOutputStreamOperator<Void> appendCommitter(
+        DataStream<FlinkWriteResult> writerStream,
+        OneInputStreamOperatorFactory<FlinkWriteResult, Void> filesCommitterFactory) {
       SingleOutputStreamOperator<Void> committerStream =
           writerStream
               .transform(

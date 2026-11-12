@@ -23,21 +23,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.state.CheckpointListener;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.RestartStrategyOptions;
+import org.apache.flink.configuration.StateRecoveryOptions;
+import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
 import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileContent;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
@@ -68,10 +78,11 @@ import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 
-/** POC tests for the index-backed DV upsert mode of {@link IcebergSink}. */
+/** POC tests for the index-backed DV upsert mode of {@link FlinkSink}. */
 @ExtendWith(ParameterizedTestExtension.class)
-@Timeout(value = 120)
+@Timeout(value = 180)
 class TestIcebergSinkIndexDv {
   @RegisterExtension
   static final MiniClusterExtension MINI_CLUSTER_EXTENSION =
@@ -91,9 +102,21 @@ class TestIcebergSinkIndexDv {
   @Parameter(index = 1)
   private boolean partitioned;
 
-  @Parameters(name = "parallelism={0}, partitioned={1}")
+  @Parameter(index = 2)
+  private DistributionMode distributionMode;
+
+  @TempDir private Path savepointDir;
+
+  @Parameters(name = "parallelism={0}, partitioned={1}, distribution={2}")
   static Object[][] parameters() {
-    return new Object[][] {{1, false}, {2, false}, {2, true}};
+    return new Object[][] {
+      {1, false, DistributionMode.NONE},
+      {2, false, DistributionMode.NONE},
+      {2, true, DistributionMode.NONE},
+      {2, true, DistributionMode.HASH},
+      {2, false, DistributionMode.RANGE},
+      {2, true, DistributionMode.RANGE},
+    };
   }
 
   @TestTemplate
@@ -108,6 +131,13 @@ class TestIcebergSinkIndexDv {
     List<String> expected = applyUpserts(Maps.newHashMap(), batches);
     assertThat(liveRows(dvTable)).containsExactlyInAnyOrderElementsOf(expected);
     assertThat(liveRows(dvTable)).containsExactlyInAnyOrderElementsOf(liveRows(eqTable));
+    System.out.printf(
+        "LAYOUT parallelism=%d partitioned=%s distribution=%s eqDataFiles=%s dvDataFiles=%s%n",
+        parallelism,
+        partitioned,
+        distributionMode,
+        dataFilesPerPartition(eqTable),
+        dataFilesPerPartition(dvTable));
   }
 
   @TestTemplate
@@ -175,6 +205,49 @@ class TestIcebergSinkIndexDv {
   }
 
   @TestTemplate
+  void savepointRestoreRescalesKeyedIndex() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isNotEqualTo(DistributionMode.RANGE);
+    List<List<Row>> first = randomChangelog(3, 60, 40, 21);
+    List<List<Row>> second = randomChangelog(3, 60, 40, 22);
+    Table table = createTable("t_dv");
+
+    BatchesThenIdleSource.EMITTED_ALL.set(false);
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism);
+    DataStream<Row> input =
+        env.addSource(new BatchesThenIdleSource(first), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(input, table, INDEX_DV);
+    JobClient job = env.executeAsync("index-dv before rescale");
+    while (!BatchesThenIdleSource.EMITTED_ALL.get()) {
+      Thread.sleep(50);
+    }
+
+    String savepoint =
+        job.stopWithSavepoint(false, savepointDir.toUri().toString(), SavepointFormatType.CANONICAL)
+            .get(60, TimeUnit.SECONDS);
+
+    IndexDvDataWriter.BOOTSTRAPPED_KEYS.set(0);
+    Configuration restore = new Configuration();
+    restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
+    int rescaled = parallelism * 2;
+    StreamExecutionEnvironment restoredEnv = environment(restore, rescaled);
+    DataStream<Row> restoredInput =
+        restoredEnv
+            .addSource(new BoundedTestSource<>(second), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(restoredInput, table, INDEX_DV, rescaled);
+    restoredEnv.execute("index-dv after rescale");
+
+    Map<Integer, String> state = Maps.newHashMap();
+    applyUpserts(state, first);
+    assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(applyUpserts(state, second));
+    assertThat(IndexDvDataWriter.BOOTSTRAPPED_KEYS.get()).isZero();
+    assertThat(writerSubtasksOfLiveFiles(table)).contains(rescaled - 1);
+    assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+  }
+
+  @TestTemplate
   void upsertAfterPartitionSpecChange() throws Exception {
     assumeThat(partitioned).isFalse();
     Table table = createTable("t_dv");
@@ -189,6 +262,7 @@ class TestIcebergSinkIndexDv {
   @TestTemplate
   void equalityDeleteModeDuplicatesAfterPartitionSpecChange() throws Exception {
     assumeThat(partitioned).isFalse();
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
     Table table = createTable("t_eq");
     runJob(table, EQUALITY_DELETE, ImmutableList.of(initialRowsForSpecChange()), null);
 
@@ -212,46 +286,69 @@ class TestIcebergSinkIndexDv {
         partitioned
             ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).bucket("id", 3).build()
             : PartitionSpec.unpartitioned();
-    return CATALOG_EXTENSION
-        .catalog()
-        .createTable(
-            TableIdentifier.of(DATABASE, name),
-            SimpleDataUtil.SCHEMA,
-            spec,
-            ImmutableMap.of(TableProperties.FORMAT_VERSION, "3"));
+    Table table =
+        CATALOG_EXTENSION
+            .catalog()
+            .createTable(
+                TableIdentifier.of(DATABASE, name),
+                SimpleDataUtil.SCHEMA,
+                spec,
+                ImmutableMap.of(
+                    TableProperties.FORMAT_VERSION,
+                    "3",
+                    TableProperties.WRITE_DISTRIBUTION_MODE,
+                    distributionMode.modeName()));
+    if (distributionMode == DistributionMode.RANGE && !partitioned) {
+      table.replaceSortOrder().asc("id").commit();
+    }
+
+    return table;
   }
 
-  private void runJob(Table table, String upsertMode, List<List<Row>> batches, FailOnce failer)
-      throws Exception {
+  private StreamExecutionEnvironment environment(Configuration extra, int envParallelism) {
     Configuration config =
         new Configuration(MiniFlinkClusterExtension.DISABLE_CLASSLOADER_CHECK_CONFIG);
     config.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
     config.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 1);
-    StreamExecutionEnvironment env =
-        StreamExecutionEnvironment.getExecutionEnvironment(config)
-            .enableCheckpointing(100L)
-            .setParallelism(parallelism)
-            .setMaxParallelism(MAX_PARALLELISM);
+    config.addAll(extra);
+    return StreamExecutionEnvironment.getExecutionEnvironment(config)
+        .enableCheckpointing(100L)
+        .setParallelism(envParallelism)
+        .setMaxParallelism(MAX_PARALLELISM);
+  }
 
+  private void runJob(Table table, String upsertMode, List<List<Row>> batches, FailOnce failer)
+      throws Exception {
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism);
     DataStream<Row> input =
         env.addSource(new BoundedTestSource<>(batches), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO);
     if (failer != null) {
       input = input.map(failer, TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO).setParallelism(1);
     }
 
+    sink(input, table, upsertMode);
+    env.execute("index-dv test " + upsertMode);
+    table.refresh();
+  }
+
+  private void sink(DataStream<Row> input, Table table, String upsertMode) {
+    sink(input, table, upsertMode, parallelism);
+  }
+
+  private static void sink(
+      DataStream<Row> input, Table table, String upsertMode, int writeParallelism) {
     TableLoader tableLoader =
         TableLoader.fromCatalog(
             CATALOG_EXTENSION.catalogLoader(), TableIdentifier.of(DATABASE, tableName(table)));
-    IcebergSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
+    FlinkSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
         .tableLoader(tableLoader)
-        .writeParallelism(parallelism)
+        .resolvedSchema(SimpleDataUtil.FLINK_SCHEMA)
+        .writeParallelism(writeParallelism)
         .equalityFieldColumns(ImmutableList.of("id"))
         .upsert(true)
+        .uidPrefix("sink")
         .set(FlinkWriteOptions.UPSERT_MODE.key(), upsertMode)
         .append();
-
-    env.execute("index-dv test " + upsertMode);
-    table.refresh();
   }
 
   private static String tableName(Table table) {
@@ -269,6 +366,31 @@ class TestIcebergSinkIndexDv {
     }
 
     return rows;
+  }
+
+  private static Map<String, Integer> dataFilesPerPartition(Table table) throws IOException {
+    table.refresh();
+    Map<String, Integer> counts = Maps.newTreeMap();
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        counts.merge(task.file().partition().toString(), 1, Integer::sum);
+      }
+    }
+
+    return counts;
+  }
+
+  private static List<Integer> writerSubtasksOfLiveFiles(Table table) throws IOException {
+    List<Integer> subtasks = Lists.newArrayList();
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        DataFile file = task.file();
+        String name = file.location().substring(file.location().lastIndexOf('/') + 1);
+        subtasks.add(Integer.parseInt(name.substring(0, name.indexOf('-'))));
+      }
+    }
+
+    return subtasks;
   }
 
   private static int countDeleteFiles(Table table, FileContent content) throws IOException {
@@ -315,7 +437,7 @@ class TestIcebergSinkIndexDv {
       List<Row> batch = Lists.newArrayList();
       for (int i = 0; i < rowsPerCheckpoint; i++) {
         int id = random.nextInt(keys);
-        String data = "v" + c + "_" + i;
+        String data = "v" + seed + "_" + c + "_" + i;
         int kind = random.nextInt(10);
         if (kind < 5) {
           batch.add(row("+I", id, data));
@@ -365,6 +487,48 @@ class TestIcebergSinkIndexDv {
       }
 
       return value;
+    }
+  }
+
+  /** Emits each batch after two completed checkpoints, then idles until stopped. */
+  private static class BatchesThenIdleSource implements SourceFunction<Row>, CheckpointListener {
+    private static final AtomicBoolean EMITTED_ALL = new AtomicBoolean();
+
+    private final List<List<Row>> batches;
+    private final AtomicInteger completedCheckpoints = new AtomicInteger();
+    private volatile boolean running = true;
+
+    BatchesThenIdleSource(List<List<Row>> batches) {
+      this.batches = batches;
+    }
+
+    @Override
+    public void run(SourceContext<Row> ctx) throws Exception {
+      for (List<Row> batch : batches) {
+        synchronized (ctx.getCheckpointLock()) {
+          batch.forEach(ctx::collect);
+        }
+
+        int target = completedCheckpoints.get() + 2;
+        while (running && completedCheckpoints.get() < target) {
+          Thread.sleep(10);
+        }
+      }
+
+      EMITTED_ALL.set(true);
+      while (running) {
+        Thread.sleep(10);
+      }
+    }
+
+    @Override
+    public void cancel() {
+      this.running = false;
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) {
+      completedCheckpoints.incrementAndGet();
     }
   }
 }

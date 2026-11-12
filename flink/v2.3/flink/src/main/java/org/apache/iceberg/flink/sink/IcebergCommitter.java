@@ -19,25 +19,19 @@
 package org.apache.iceberg.flink.sink;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.core.io.SimpleVersionedSerialization;
 import org.apache.iceberg.AppendFiles;
-import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.ManifestFile;
-import org.apache.iceberg.ManifestFiles;
-import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.ReplacePartitions;
 import org.apache.iceberg.RowDelta;
-import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.flink.TableLoader;
@@ -46,8 +40,6 @@ import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTest
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
@@ -89,7 +81,6 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
   private final boolean tableMaintenanceEnabled;
   private final boolean isRestored;
   private final int subtaskId;
-  private final boolean indexDvMode;
 
   IcebergCommitter(
       TableLoader tableLoader,
@@ -102,35 +93,7 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
       boolean tableMaintenanceEnabled,
       boolean isRestored,
       int subtaskId) {
-    this(
-        tableLoader,
-        branch,
-        snapshotProperties,
-        replacePartitions,
-        workerPoolSize,
-        sinkId,
-        committerMetrics,
-        tableMaintenanceEnabled,
-        isRestored,
-        subtaskId,
-        false);
-  }
-
-  @SuppressWarnings("checkstyle:ParameterNumber")
-  IcebergCommitter(
-      TableLoader tableLoader,
-      String branch,
-      Map<String, String> snapshotProperties,
-      boolean replacePartitions,
-      int workerPoolSize,
-      String sinkId,
-      IcebergFilesCommitterMetrics committerMetrics,
-      boolean tableMaintenanceEnabled,
-      boolean isRestored,
-      int subtaskId,
-      boolean indexDvMode) {
     this.branch = branch;
-    this.indexDvMode = indexDvMode;
     this.snapshotProperties = snapshotProperties;
     this.replacePartitions = replacePartitions;
     this.committerMetrics = committerMetrics;
@@ -338,76 +301,12 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
 
         Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
         Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
-        if (indexDvMode) {
-          prepareIndexDvCommit(rowDelta, result, operatorId);
-        }
 
         String description = "rowDelta";
         logCommitSummary(summary, description);
         commitOperation(rowDelta, description, newFlinkJobId, operatorId, e.getKey());
       }
     }
-  }
-
-  /**
-   * POC: the DVs of an index-dv writer delete rows of data files committed earlier, so the commit
-   * replaces their live DVs and validates against commits by others since this sink's last commit.
-   */
-  private void prepareIndexDvCommit(RowDelta rowDelta, WriteResult result, String operatorId) {
-    for (DeleteFile deleteFile : result.deleteFiles()) {
-      Preconditions.checkState(
-          ContentFileUtil.isDV(deleteFile),
-          "Upsert mode 'index-dv' must commit only deletion vectors, found %s",
-          deleteFile.location());
-    }
-
-    table.refresh();
-    Snapshot head = table.snapshot(branch);
-    if (head == null) {
-      return;
-    }
-
-    rowDelta.validateFromSnapshot(lastSnapshotOf(head, operatorId));
-    rowDelta.validateDataFilesExist(Arrays.asList(result.referencedDataFiles()));
-    rowDelta.validateDeletedFiles();
-    rowDelta.validateNoConflictingDeleteFiles();
-
-    Set<String> referenced = Sets.newHashSet();
-    for (DeleteFile dv : result.deleteFiles()) {
-      referenced.add(dv.referencedDataFile());
-    }
-
-    // shortcut: reads every delete manifest of the head on each commit, upgrade to a DV lookup
-    for (ManifestFile manifest : head.deleteManifests(table.io())) {
-      try (ManifestReader<DeleteFile> reader =
-          ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs())) {
-        for (DeleteFile live : reader) {
-          if (ContentFileUtil.isDV(live) && referenced.contains(live.referencedDataFile())) {
-            rowDelta.removeDeletes(live.copy());
-          }
-        }
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
-      }
-    }
-  }
-
-  /**
-   * Returns the newest snapshot committed by this sink, or the head when there is none.
-   *
-   * <p>shortcut: on the first commit of a new sink, commits by others between the writer's
-   * bootstrap and this commit are not validated.
-   */
-  private long lastSnapshotOf(Snapshot head, String operatorId) {
-    for (Snapshot snapshot = head;
-        snapshot != null;
-        snapshot = snapshot.parentId() == null ? null : table.snapshot(snapshot.parentId())) {
-      if (operatorId.equals(snapshot.summary().get(SinkUtil.OPERATOR_ID))) {
-        return snapshot.snapshotId();
-      }
-    }
-
-    return head.snapshotId();
   }
 
   private void commitOperation(

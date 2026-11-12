@@ -1,0 +1,450 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.iceberg.flink.sink;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
+import org.apache.flink.runtime.state.StateInitializationContext;
+import org.apache.flink.runtime.state.StateSnapshotContext;
+import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
+import org.apache.flink.streaming.api.operators.BoundedOneInput;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.util.OutputTag;
+import org.apache.iceberg.Accessor;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileContent;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataColumns;
+import org.apache.iceberg.PartitionKey;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.StructLike;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.data.GenericDeleteFilter;
+import org.apache.iceberg.data.InternalRecordWrapper;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.flink.RowDataWrapper;
+import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.maintenance.operator.DVPosition;
+import org.apache.iceberg.flink.maintenance.operator.SerializedEqualityValues;
+import org.apache.iceberg.flink.maintenance.operator.StructLikeSerializer;
+import org.apache.iceberg.formats.FormatModelRegistry;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.FileWriterFactory;
+import org.apache.iceberg.io.OutputFileFactory;
+import org.apache.iceberg.io.RollingDataWriter;
+import org.apache.iceberg.io.WriteResult;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.TypeUtil;
+import org.apache.iceberg.types.Types.NestedField;
+import org.apache.iceberg.util.ContentFileUtil;
+import org.apache.iceberg.util.StructLikeMap;
+import org.apache.iceberg.util.StructProjection;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * POC: upsert writer keyed by the equality key. It writes the data files itself, so the position of
+ * every new row is known when it is written, and keeps the location of each key's live row in keyed
+ * state. A previous row is retired by emitting its position to {@link #DELETES}, which a DV writer
+ * keyed by data file turns into deletion vectors.
+ */
+class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
+    implements OneInputStreamOperator<RowData, FlinkWriteResult>, BoundedOneInput {
+  private static final Logger LOG = LoggerFactory.getLogger(IndexDvDataWriter.class);
+
+  static final OutputTag<DVPosition> DELETES =
+      new OutputTag<>("index-dv-deletes", TypeInformation.of(DVPosition.class));
+
+  private static final int SUBTASK_BITS = 12;
+  private static final long MAX_POSITION = 0xFFFFFFFFL;
+
+  @VisibleForTesting static final AtomicLong LAST_BOOTSTRAP_MILLIS = new AtomicLong(-1);
+  @VisibleForTesting static final AtomicLong BOOTSTRAPPED_KEYS = new AtomicLong();
+
+  private final TableLoader tableLoader;
+  private final RowType flinkRowType;
+  private final Set<Integer> equalityFieldIds;
+  private final FileFormat format;
+  private final long targetFileSize;
+  private final Map<String, String> writeProperties;
+  private final Long bootstrapSnapshotId;
+
+  private transient Table table;
+  private transient PartitionSpec spec;
+  private transient FileWriterFactory<RowData> fileWriterFactory;
+  private transient OutputFileFactory fileFactory;
+  private transient RowDataWrapper wrapper;
+  private transient PartitionKey partitionKey;
+  private transient StructLikeSerializer serializer;
+  private transient Map<StructLike, RollingDataWriter<RowData>> dataWriters;
+
+  private transient ValueState<Long> location;
+  private transient ListState<byte[]> fileDictionaryState;
+  private transient Map<Integer, FileEntry> files;
+  private transient Map<String, Integer> fileIds;
+  private transient int subtaskIndex;
+  private transient int nextFileCounter;
+  private transient boolean inputEnded;
+
+  static final class FileEntry {
+    private final int id;
+    private final String path;
+    private final int specId;
+    private final byte[] partition;
+
+    FileEntry(int id, String path, int specId, byte[] partition) {
+      this.id = id;
+      this.path = path;
+      this.specId = specId;
+      this.partition = partition;
+    }
+
+    int id() {
+      return id;
+    }
+
+    String path() {
+      return path;
+    }
+
+    int specId() {
+      return specId;
+    }
+
+    byte[] partition() {
+      return partition;
+    }
+  }
+
+  IndexDvDataWriter(
+      TableLoader tableLoader,
+      RowType flinkRowType,
+      Set<Integer> equalityFieldIds,
+      FileFormat format,
+      long targetFileSize,
+      Map<String, String> writeProperties,
+      Long bootstrapSnapshotId) {
+    this.tableLoader = tableLoader;
+    this.flinkRowType = flinkRowType;
+    this.equalityFieldIds = equalityFieldIds;
+    this.format = format;
+    this.targetFileSize = targetFileSize;
+    this.writeProperties = writeProperties;
+    this.bootstrapSnapshotId = bootstrapSnapshotId;
+  }
+
+  @Override
+  public void initializeState(StateInitializationContext context) throws Exception {
+    super.initializeState(context);
+    this.subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+    Preconditions.checkState(
+        subtaskIndex < (1 << SUBTASK_BITS), "POC: index-dv supports < 4096 writer subtasks");
+
+    TableLoader loader = tableLoader.clone();
+    loader.open();
+    this.table = loader.loadTable();
+    this.spec = table.spec();
+    Schema schema = table.schema();
+    this.fileWriterFactory =
+        new FlinkFileWriterFactory.Builder(table)
+            .dataFileFormat(format)
+            .dataSchema(schema)
+            .dataFlinkType(flinkRowType)
+            .writerProperties(writeProperties)
+            .build();
+    this.fileFactory =
+        OutputFileFactory.builderFor(
+                table, subtaskIndex, getRuntimeContext().getTaskInfo().getAttemptNumber())
+            .format(format)
+            .defaultSpec(spec)
+            .build();
+    this.wrapper = new RowDataWrapper(flinkRowType, schema.asStruct());
+    this.partitionKey = new PartitionKey(spec, schema);
+    this.serializer = new StructLikeSerializer();
+    this.dataWriters = StructLikeMap.create(spec.partitionType());
+
+    this.location =
+        context
+            .getKeyedStateStore()
+            .getState(new ValueStateDescriptor<>("index-dv-location", Types.LONG));
+    this.fileDictionaryState =
+        context
+            .getOperatorStateStore()
+            .getUnionListState(
+                new ListStateDescriptor<>(
+                    "index-dv-files", PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
+    this.files = Maps.newHashMap();
+    this.fileIds = Maps.newHashMap();
+    int maxCounter = -1;
+    for (byte[] encoded : fileDictionaryState.get()) {
+      FileEntry entry = decode(encoded);
+      files.put(entry.id(), entry);
+      if ((entry.id() & ((1 << SUBTASK_BITS) - 1)) == subtaskIndex) {
+        maxCounter = Math.max(maxCounter, entry.id() >>> SUBTASK_BITS);
+      }
+    }
+
+    this.nextFileCounter = maxCounter + 1;
+    if (!context.isRestored()) {
+      bootstrap();
+    }
+  }
+
+  @Override
+  public void processElement(StreamRecord<RowData> element) throws Exception {
+    RowData row = element.getValue();
+    switch (row.getRowKind()) {
+      case INSERT, UPDATE_AFTER -> {
+        retire();
+        append(row);
+      }
+      case DELETE -> retire();
+      case UPDATE_BEFORE -> {
+        // upsert: the UPDATE_AFTER retires the previous row by key
+      }
+    }
+  }
+
+  private void retire() throws IOException {
+    Long packed = location.value();
+    if (packed != null) {
+      FileEntry file = files.get((int) (packed >>> 32));
+      output.collect(
+          DELETES,
+          new StreamRecord<>(
+              new DVPosition(
+                  file.path(), packed & MAX_POSITION, file.specId(), file.partition(), 0)));
+      location.clear();
+    }
+  }
+
+  private void append(RowData row) throws IOException {
+    partitionKey.partition(wrapper.wrap(row));
+    RollingDataWriter<RowData> writer = dataWriters.get(partitionKey);
+    if (writer == null) {
+      StructLike partition = spec.isUnpartitioned() ? null : partitionKey.copy();
+      writer =
+          new RollingDataWriter<>(
+              fileWriterFactory, fileFactory, table.io(), targetFileSize, spec, partition);
+      dataWriters.put(partitionKey.copy(), writer);
+    }
+
+    String path = writer.currentFilePath().toString();
+    long pos = writer.currentFileRows();
+    writer.write(row);
+    Integer fileId = fileIds.get(path);
+    if (fileId == null) {
+      fileId = register(path, spec, partitionKey);
+    }
+
+    location.update(pack(fileId, pos));
+  }
+
+  private int register(String path, PartitionSpec fileSpec, StructLike partition) {
+    int id = (nextFileCounter++ << SUBTASK_BITS) | subtaskIndex;
+    Preconditions.checkState(id >= 0, "POC: index-dv file id space exhausted");
+    files.put(
+        id,
+        new FileEntry(
+            id,
+            path,
+            fileSpec.specId(),
+            serializer.encodePartition(partition, fileSpec.partitionType())));
+    fileIds.put(path, id);
+    return id;
+  }
+
+  private static long pack(int fileId, long pos) {
+    Preconditions.checkState(pos <= MAX_POSITION, "POC: row position %s too large", pos);
+    return ((long) fileId << 32) | pos;
+  }
+
+  /**
+   * Indexes the keys this subtask owns from the live rows of the bootstrap snapshot.
+   *
+   * <p>shortcut: every subtask reads the key columns of every data file and keeps its own key
+   * groups; upgrade to a split read with a shuffle, incremental catch-up (#18717) or a shared index
+   * extract (#16961).
+   */
+  private void bootstrap() throws IOException {
+    if (bootstrapSnapshotId == null) {
+      return;
+    }
+
+    long start = System.currentTimeMillis();
+    Schema keySchema = TypeUtil.select(table.schema(), equalityFieldIds);
+    List<NestedField> columns = Lists.newArrayList(keySchema.columns());
+    columns.add(MetadataColumns.ROW_POSITION);
+    Schema requested = new Schema(columns);
+    InternalRecordWrapper keyWrapper = new InternalRecordWrapper(keySchema.asStruct());
+    int maxParallelism = getRuntimeContext().getTaskInfo().getMaxNumberOfParallelSubtasks();
+    KeyGroupRange ownedKeyGroups =
+        KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(
+            maxParallelism,
+            getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks(),
+            getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
+    long keys = 0;
+
+    try (CloseableIterable<FileScanTask> tasks =
+        table.newScan().useSnapshot(bootstrapSnapshotId).planFiles()) {
+      for (FileScanTask task : tasks) {
+        DataFile file = task.file();
+        for (DeleteFile delete : task.deletes()) {
+          Preconditions.checkState(
+              delete.content() != FileContent.POSITION_DELETES || ContentFileUtil.isDV(delete),
+              "POC: index-dv upsert mode does not support V2 position delete files: %s",
+              delete.location());
+        }
+
+        int fileId = register(file.location(), table.specs().get(file.specId()), file.partition());
+        GenericDeleteFilter filter =
+            new GenericDeleteFilter(table.io(), task, table.schema(), requested);
+        Schema readSchema = filter.requiredSchema();
+        StructProjection keyProjection = StructProjection.create(readSchema, keySchema);
+        Accessor<StructLike> posAccessor =
+            readSchema.accessorForField(MetadataColumns.ROW_POSITION.fieldId());
+        CloseableIterable<Record> records =
+            FormatModelRegistry.<Record, Schema>readBuilder(
+                    file.format(), Record.class, table.io().newInputFile(file.location()))
+                .project(readSchema)
+                .build();
+        try (CloseableIterable<Record> live = filter.filter(records)) {
+          for (Record record : live) {
+            SerializedEqualityValues key =
+                serializer.serializeKey(
+                    keyWrapper.wrap(keyProjection.wrap(record)), keySchema.asStruct());
+            if (ownedKeyGroups.contains(
+                KeyGroupRangeAssignment.assignToKeyGroup(key, maxParallelism))) {
+              getKeyedStateBackend().setCurrentKey(key);
+              location.update(pack(fileId, (long) posAccessor.get(record)));
+              keys++;
+            }
+          }
+        }
+      }
+    }
+
+    long millis = System.currentTimeMillis() - start;
+    LAST_BOOTSTRAP_MILLIS.accumulateAndGet(millis, Math::max);
+    BOOTSTRAPPED_KEYS.addAndGet(keys);
+    LOG.info("Bootstrapped {} keys on subtask {} in {} ms", keys, subtaskIndex, millis);
+  }
+
+  @Override
+  public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    super.prepareSnapshotPreBarrier(checkpointId);
+    flush(checkpointId);
+  }
+
+  @Override
+  public void snapshotState(StateSnapshotContext context) throws Exception {
+    super.snapshotState(context);
+    // shortcut: the whole dictionary on every checkpoint; upgrade to GC of unreferenced files
+    List<byte[]> encoded = Lists.newArrayListWithCapacity(files.size());
+    for (FileEntry entry : files.values()) {
+      encoded.add(encode(entry));
+    }
+
+    fileDictionaryState.update(encoded);
+  }
+
+  @Override
+  public void endInput() throws IOException {
+    flush(IcebergStreamWriter.END_INPUT_CHECKPOINT_ID);
+    this.inputEnded = true;
+  }
+
+  private void flush(long checkpointId) throws IOException {
+    if (inputEnded) {
+      return;
+    }
+
+    List<DataFile> dataFiles = Lists.newArrayList();
+    for (RollingDataWriter<RowData> writer : dataWriters.values()) {
+      writer.close();
+      dataFiles.addAll(writer.result().dataFiles());
+    }
+
+    dataWriters.clear();
+    fileIds.clear();
+    output.collect(
+        new StreamRecord<>(
+            new FlinkWriteResult(
+                checkpointId, WriteResult.builder().addDataFiles(dataFiles).build())));
+  }
+
+  @Override
+  public void close() throws Exception {
+    super.close();
+    if (dataWriters != null) {
+      for (RollingDataWriter<RowData> writer : dataWriters.values()) {
+        writer.close();
+      }
+    }
+  }
+
+  private static byte[] encode(FileEntry entry) throws IOException {
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    try (DataOutputStream out = new DataOutputStream(bytes)) {
+      out.writeInt(entry.id());
+      out.writeUTF(entry.path());
+      out.writeInt(entry.specId());
+      out.writeInt(entry.partition().length);
+      out.write(entry.partition());
+    }
+
+    return bytes.toByteArray();
+  }
+
+  private static FileEntry decode(byte[] encoded) throws IOException {
+    try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(encoded))) {
+      int id = in.readInt();
+      String path = in.readUTF();
+      int specId = in.readInt();
+      byte[] partition = new byte[in.readInt()];
+      in.readFully(partition);
+      return new FileEntry(id, path, specId, partition);
+    }
+  }
+}

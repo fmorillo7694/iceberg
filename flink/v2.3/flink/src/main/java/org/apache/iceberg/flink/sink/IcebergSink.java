@@ -23,7 +23,6 @@ import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,9 +39,7 @@ import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
 import org.apache.flink.api.connector.sink2.Sink;
 import org.apache.flink.api.connector.sink2.SinkWriter;
-import org.apache.flink.api.connector.sink2.StatefulSinkWriter;
 import org.apache.flink.api.connector.sink2.SupportsCommitter;
-import org.apache.flink.api.connector.sink2.SupportsWriterState;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
@@ -72,7 +69,6 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.FlinkWriteOptions;
@@ -99,7 +95,6 @@ import org.apache.iceberg.flink.sink.shuffle.StatisticsType;
 import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -256,12 +251,7 @@ public class IcebergSink
         metrics,
         maintenanceEnabled,
         context.getRestoredCheckpointId().isPresent(),
-        context.getTaskInfo().getIndexOfThisSubtask(),
-        indexDvMode());
-  }
-
-  boolean indexDvMode() {
-    return false;
+        context.getTaskInfo().getIndexOfThisSubtask());
   }
 
   @Override
@@ -760,7 +750,6 @@ public class IcebergSink
       return this;
     }
 
-    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     IcebergSink build() {
 
       Preconditions.checkArgument(
@@ -788,6 +777,9 @@ public class IcebergSink
       Set<Integer> equalityFieldIds =
           SinkUtil.checkAndGetEqualityFieldIds(table, equalityFieldColumns);
 
+      Preconditions.checkState(
+          !flinkWriteConf.upsertIndexDvMode(),
+          "POC: upsert-mode 'index-dv' is implemented for FlinkSink only");
       if (flinkWriteConf.upsertMode()) {
         Preconditions.checkState(
             !overwriteMode,
@@ -845,36 +837,6 @@ public class IcebergSink
 
       Set<String> equalityFieldColumnsSet =
           equalityFieldColumns != null ? Sets.newHashSet(equalityFieldColumns) : null;
-
-      if (flinkWriteConf.upsertIndexDvMode()) {
-        Preconditions.checkState(
-            flinkWriteConf.upsertMode(), "POC: upsert-mode 'index-dv' requires upsert enabled");
-        Preconditions.checkState(
-            TableUtil.formatVersion(table) >= 3,
-            "Upsert mode 'index-dv' requires format version 3 or later, table %s is version %s",
-            table.name(),
-            TableUtil.formatVersion(table));
-        Preconditions.checkState(
-            !flinkWriteConf.convertEqualityDeletesMode(),
-            "Upsert mode 'index-dv' writes no equality deletes; disable convert-equality-deletes");
-        return new IndexDvIcebergSink(
-            tableLoader,
-            table,
-            snapshotSummary,
-            flinkWriteConf.uidSuffix(),
-            SinkUtil.writeProperties(flinkWriteConf.dataFileFormat(), flinkWriteConf, table),
-            resolvedSchema != null
-                ? toFlinkRowType(table.schema(), resolvedSchema)
-                : toFlinkRowType(table.schema(), tableSchema),
-            tableSupplier,
-            flinkWriteConf,
-            equalityFieldIds,
-            flinkWriteConf.branch(),
-            overwriteMode,
-            maintenanceTasks,
-            flinkMaintenanceConfig,
-            equalityFieldColumnsSet);
-      }
 
       return new IcebergSink(
           tableLoader,
@@ -1224,98 +1186,5 @@ public class IcebergSink
    */
   public static Builder forRowData(DataStream<RowData> input) {
     return new Builder().forRowData(input);
-  }
-
-  /**
-   * POC: an {@link IcebergSink} whose upserts retire previous rows with deletion vectors instead of
-   * equality deletes. The writers keep a key position index in their checkpointed state.
-   */
-  static class IndexDvIcebergSink extends IcebergSink
-      implements SupportsWriterState<RowData, IndexDvWriterState> {
-
-    @SuppressWarnings("checkstyle:ParameterNumber")
-    private IndexDvIcebergSink(
-        TableLoader tableLoader,
-        Table table,
-        Map<String, String> snapshotProperties,
-        String uidSuffix,
-        Map<String, String> writeProperties,
-        RowType flinkRowType,
-        SerializableSupplier<Table> tableSupplier,
-        FlinkWriteConf flinkWriteConf,
-        Set<Integer> equalityFieldIds,
-        String branch,
-        boolean overwriteMode,
-        List<MaintenanceTaskBuilder<?>> maintenanceTasks,
-        FlinkMaintenanceConfig flinkMaintenanceConfig,
-        Set<String> equalityFieldColumns) {
-      super(
-          tableLoader,
-          table,
-          snapshotProperties,
-          uidSuffix,
-          writeProperties,
-          flinkRowType,
-          tableSupplier,
-          flinkWriteConf,
-          equalityFieldIds,
-          branch,
-          overwriteMode,
-          maintenanceTasks,
-          flinkMaintenanceConfig,
-          equalityFieldColumns);
-    }
-
-    @Override
-    boolean indexDvMode() {
-      return true;
-    }
-
-    @Override
-    public DataStream<RowData> addPreWriteTopology(DataStream<RowData> inputDataStream) {
-      IcebergSink sink = this;
-      // Every key must reach the subtask that owns its index entry, whatever the partition spec.
-      return inputDataStream.keyBy(
-          new EqualityFieldKeySelector(
-              sink.table.schema(), sink.flinkRowType, sink.equalityFieldIds));
-    }
-
-    @Override
-    public SinkWriter<RowData> createWriter(WriterInitContext context) {
-      try {
-        return restoreWriter(context, ImmutableList.of());
-      } catch (IOException e) {
-        throw new UncheckedIOException("Failed to create index-dv writer", e);
-      }
-    }
-
-    @Override
-    public StatefulSinkWriter<RowData, IndexDvWriterState> restoreWriter(
-        WriterInitContext context, Collection<IndexDvWriterState> recoveredState)
-        throws IOException {
-      IcebergSink sink = this;
-      TableLoader loader = sink.tableLoader.clone();
-      loader.open();
-      // Load the latest table, not the one serialized with the job graph, to bootstrap the index.
-      Table latest = loader.loadTable();
-      return new IndexDvSinkWriter(
-          latest,
-          sink.branch,
-          sink.flinkRowType,
-          sink.equalityFieldIds,
-          sink.dataFileFormat,
-          sink.targetDataFileSize,
-          sink.writeProperties,
-          context.getTaskInfo().getIndexOfThisSubtask(),
-          context.getTaskInfo().getAttemptNumber(),
-          context.getTaskInfo().getNumberOfParallelSubtasks(),
-          context.getTaskInfo().getMaxNumberOfParallelSubtasks(),
-          recoveredState);
-    }
-
-    @Override
-    public SimpleVersionedSerializer<IndexDvWriterState> getWriterStateSerializer() {
-      return new IndexDvWriterState.Serializer();
-    }
   }
 }

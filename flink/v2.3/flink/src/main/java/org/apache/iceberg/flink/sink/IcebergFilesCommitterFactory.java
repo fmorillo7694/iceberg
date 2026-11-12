@@ -35,6 +35,8 @@ class IcebergFilesCommitterFactory
   private final int workerPoolSize;
   private final String branch;
   private final PartitionSpec spec;
+  private boolean indexDvMode = false;
+  private Long bootstrapSnapshotId = null;
 
   IcebergFilesCommitterFactory(
       TableLoader tableLoader,
@@ -51,10 +53,29 @@ class IcebergFilesCommitterFactory
     this.spec = spec;
   }
 
+  /** POC: commits for the index-dv upsert mode, see {@link IndexDvCommits}. */
+  IcebergFilesCommitterFactory indexDvMode(Long writersBootstrapSnapshotId) {
+    this.indexDvMode = true;
+    this.bootstrapSnapshotId = writersBootstrapSnapshotId;
+    return this;
+  }
+
   @Override
   public StreamOperator createStreamOperator(StreamOperatorParameters parameters) {
-    return new IcebergFilesCommitter(
-        parameters, tableLoader, overwriteMode, snapshotProperties, workerPoolSize, branch, spec);
+    IcebergFilesCommitter committer =
+        new IcebergFilesCommitter(
+            parameters,
+            tableLoader,
+            overwriteMode,
+            snapshotProperties,
+            workerPoolSize,
+            branch,
+            spec);
+    if (indexDvMode) {
+      committer.indexDvMode(bootstrapSnapshotId);
+    }
+
+    return committer;
   }
 
   @Override
