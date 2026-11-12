@@ -224,7 +224,7 @@ class TestIcebergSinkIndexDv {
     }
 
     String savepoint =
-        job.stopWithSavepoint(false, savepointDir.toUri().toString(), SavepointFormatType.CANONICAL)
+        job.stopWithSavepoint(false, savepointDir.toString(), SavepointFormatType.CANONICAL)
             .get(60, TimeUnit.SECONDS);
 
     IndexDvDataWriter.BOOTSTRAPPED_KEYS.set(0);
