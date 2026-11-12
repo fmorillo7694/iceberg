@@ -58,6 +58,10 @@ public class FlinkWriteOptions {
   public static final ConfigOption<Boolean> WRITE_UPSERT_ENABLED =
       ConfigOptions.key("upsert-enabled").booleanType().noDefaultValue();
 
+  // POC: how upserts retire previous rows; "equality-delete" (default) or "index-dv"
+  public static final ConfigOption<String> UPSERT_MODE =
+      ConfigOptions.key("upsert-mode").stringType().defaultValue("equality-delete");
+
   public static final ConfigOption<Boolean> OVERWRITE_MODE =
       ConfigOptions.key("overwrite-enabled").booleanType().defaultValue(false);
 

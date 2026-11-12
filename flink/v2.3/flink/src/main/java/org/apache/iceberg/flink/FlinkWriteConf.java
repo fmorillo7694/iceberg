@@ -19,6 +19,7 @@
 package org.apache.iceberg.flink;
 
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Map;
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.configuration.ReadableConfig;
@@ -76,6 +77,24 @@ public class FlinkWriteConf {
         .tableProperty(TableProperties.UPSERT_ENABLED)
         .defaultValue(TableProperties.UPSERT_ENABLED_DEFAULT)
         .parse();
+  }
+
+  /** POC: whether upserts resolve keys to positions and write deletion vectors. */
+  public boolean upsertIndexDvMode() {
+    String mode =
+        confParser
+            .stringConf()
+            .option(FlinkWriteOptions.UPSERT_MODE.key())
+            .flinkConfig(FlinkWriteOptions.UPSERT_MODE)
+            .defaultValue(FlinkWriteOptions.UPSERT_MODE.defaultValue())
+            .parse();
+    return switch (mode.toLowerCase(Locale.ROOT)) {
+      case "index-dv" -> true;
+      case "equality-delete" -> false;
+      default ->
+          throw new IllegalArgumentException(
+              "Invalid upsert-mode: " + mode + ", expected 'equality-delete' or 'index-dv'");
+    };
   }
 
   public FileFormat dataFileFormat() {

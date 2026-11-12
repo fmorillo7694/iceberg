@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.List;
+import org.apache.flink.annotation.Internal;
 import org.apache.iceberg.PartitionData;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.types.Conversions;
@@ -43,7 +44,9 @@ import org.apache.iceberg.types.Types;
  *   <li>{@link #encodePartition} / {@link #decodePartition} serialize partition tuples into bytes.
  * </ul>
  */
-class StructLikeSerializer {
+// shortcut (POC): made public so the index-dv sink writer can reuse the converter's key encoding.
+@Internal
+public class StructLikeSerializer {
 
   static final byte[] EMPTY_PARTITION = new byte[0];
 

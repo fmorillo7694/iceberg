@@ -23,11 +23,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.util.List;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 @Internal
 public class DeltaManifestsSerializer implements SimpleVersionedSerializer<DeltaManifests> {
@@ -70,6 +72,17 @@ public class DeltaManifestsSerializer implements SimpleVersionedSerializer<Delta
     out.writeInt(referencedDataFiles.length);
     for (CharSequence referencedDataFile : referencedDataFiles) {
       out.writeUTF(referencedDataFile.toString());
+    }
+
+    // shortcut (POC): optional trailing section, ignored by readers that predate it; a real change
+    // would bump the serializer version
+    if (!deltaManifests.otherSpecDeleteManifests().isEmpty()) {
+      out.writeInt(deltaManifests.otherSpecDeleteManifests().size());
+      for (ManifestFile manifest : deltaManifests.otherSpecDeleteManifests()) {
+        byte[] binary = ManifestFiles.encode(manifest);
+        out.writeInt(binary.length);
+        out.write(binary);
+      }
     }
 
     return binaryOut.toByteArray();
@@ -119,6 +132,17 @@ public class DeltaManifestsSerializer implements SimpleVersionedSerializer<Delta
       referencedDataFiles[i] = in.readUTF();
     }
 
-    return new DeltaManifests(dataManifest, deleteManifest, referencedDataFiles);
+    List<ManifestFile> otherSpecDeleteManifests = Lists.newArrayList();
+    if (in.available() > 0) {
+      int count = in.readInt();
+      for (int i = 0; i < count; i++) {
+        byte[] binary = new byte[in.readInt()];
+        in.readFully(binary);
+        otherSpecDeleteManifests.add(ManifestFiles.decode(binary));
+      }
+    }
+
+    return new DeltaManifests(
+        dataManifest, deleteManifest, referencedDataFiles, otherSpecDeleteManifests);
   }
 }

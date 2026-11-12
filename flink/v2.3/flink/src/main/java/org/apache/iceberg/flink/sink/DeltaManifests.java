@@ -32,6 +32,7 @@ public class DeltaManifests {
   private final ManifestFile dataManifest;
   private final ManifestFile deleteManifest;
   private final CharSequence[] referencedDataFiles;
+  private final List<ManifestFile> otherSpecDeleteManifests;
 
   DeltaManifests(ManifestFile dataManifest, ManifestFile deleteManifest) {
     this(dataManifest, deleteManifest, EMPTY_REF_DATA_FILES);
@@ -39,7 +40,16 @@ public class DeltaManifests {
 
   DeltaManifests(
       ManifestFile dataManifest, ManifestFile deleteManifest, CharSequence[] referencedDataFiles) {
+    this(dataManifest, deleteManifest, referencedDataFiles, Lists.newArrayList());
+  }
+
+  DeltaManifests(
+      ManifestFile dataManifest,
+      ManifestFile deleteManifest,
+      CharSequence[] referencedDataFiles,
+      List<ManifestFile> otherSpecDeleteManifests) {
     Preconditions.checkNotNull(referencedDataFiles, "Referenced data files shouldn't be null.");
+    this.otherSpecDeleteManifests = otherSpecDeleteManifests;
 
     this.dataManifest = dataManifest;
     this.deleteManifest = deleteManifest;
@@ -58,6 +68,11 @@ public class DeltaManifests {
     return referencedDataFiles;
   }
 
+  /** Delete manifests for delete files of a partition spec other than the delete manifest's. */
+  List<ManifestFile> otherSpecDeleteManifests() {
+    return otherSpecDeleteManifests;
+  }
+
   public List<ManifestFile> manifests() {
     List<ManifestFile> manifests = Lists.newArrayListWithCapacity(2);
     if (dataManifest != null) {
@@ -67,6 +82,8 @@ public class DeltaManifests {
     if (deleteManifest != null) {
       manifests.add(deleteManifest);
     }
+
+    manifests.addAll(otherSpecDeleteManifests);
 
     return manifests;
   }
