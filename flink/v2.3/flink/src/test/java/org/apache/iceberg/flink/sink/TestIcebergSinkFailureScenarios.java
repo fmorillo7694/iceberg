@@ -98,6 +98,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.StructLikeMap;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -127,12 +128,16 @@ class TestIcebergSinkFailureScenarios {
   @TempDir private Path compactionDir;
 
   private String mode;
+  private String staleRestore;
   private Table table;
+  private final Set<String> externalRows = Sets.newHashSet();
   private final List<String> jobFailures = Lists.newArrayList();
 
   @BeforeEach
   void before() {
     this.mode = System.getenv().getOrDefault("FAILURE_MODE", "D").toUpperCase(Locale.ROOT);
+    this.staleRestore =
+        System.getenv().getOrDefault("STALE_RESTORE", "fail").toLowerCase(Locale.ROOT);
     this.table =
         CATALOG_EXTENSION
             .catalog()
@@ -143,7 +148,14 @@ class TestIcebergSinkFailureScenarios {
                 ImmutableMap.of(TableProperties.FORMAT_VERSION, "3"));
     Control.reset();
     IndexDvDataWriter.REWRITES_APPLIED.set(0);
+    IndexDvDataWriter.REBUILDS.set(0);
+    IndexDvDataWriter.LAST_REBUILD_MILLIS.set(-1);
     IndexDvCommits.REBASED_DVS.set(0);
+  }
+
+  @AfterEach
+  void after() {
+    IcebergCommitter.setBeforeCommitAttempt(checkpointId -> {});
   }
 
   /** 1: failover to the latest checkpoint while input keeps flowing. */
@@ -151,7 +163,7 @@ class TestIcebergSinkFailureScenarios {
   void s1RestoreLatestCheckpoint() throws Exception {
     Control.failAtRecord = 150;
     runToEnd(0, null, null, 3);
-    report("s1-latest-checkpoint");
+    expect(report("s1-latest-checkpoint"), "OK");
   }
 
   /** 2: restore a retained checkpoint that is two commits behind the table. */
@@ -170,7 +182,7 @@ class TestIcebergSinkFailureScenarios {
 
     Control.holdAt = -1;
     runToEnd(0, behind, null, 0);
-    report("s2-checkpoint-behind-table");
+    expect(report("s2-checkpoint-behind-table"), staleVerdict());
   }
 
   /** 3: restore a savepoint taken before at least five more commits. */
@@ -191,7 +203,7 @@ class TestIcebergSinkFailureScenarios {
 
     Control.holdAt = -1;
     runToEnd(0, savepoint, null, 0);
-    report("s3-old-savepoint");
+    expect(report("s3-old-savepoint"), staleVerdict());
   }
 
   /** 4: stateless restart with the same job id (apache/iceberg#18098). */
@@ -202,7 +214,7 @@ class TestIcebergSinkFailureScenarios {
     runToEnd(0, null, fixed, 0);
     Control.endAt = RECORDS;
     runToEnd(200, null, fixed, 0);
-    report("s4-stateless-same-job-id");
+    expect(report("s4-stateless-same-job-id"), "OK");
   }
 
   /** 5a: a new job with a different id restores another job's stop-with-savepoint. */
@@ -219,7 +231,7 @@ class TestIcebergSinkFailureScenarios {
 
     Control.holdAt = -1;
     runToEnd(0, savepoint, null, 0);
-    report("s5a-other-job-restores-savepoint");
+    expect(report("s5a-other-job-restores-savepoint"), "OK");
   }
 
   /** 5b: two jobs with different ids both continue from the same savepoint, one after the other. */
@@ -237,7 +249,7 @@ class TestIcebergSinkFailureScenarios {
     }
 
     runToEnd(0, savepoint, null, 0);
-    report("s5b-two-jobs-same-savepoint");
+    expect(report("s5b-two-jobs-same-savepoint"), staleVerdict());
   }
 
   /** 6a: cancel while a checkpoint is blocked, restart from the last completed checkpoint. */
@@ -245,7 +257,7 @@ class TestIcebergSinkFailureScenarios {
   void s6aCancelDuringCheckpointRestoreLatest() throws Exception {
     String latest = cancelDuringCheckpoint();
     runToEnd(0, latest, null, 0);
-    report("s6a-cancel-in-checkpoint-restore-latest");
+    expect(report("s6a-cancel-in-checkpoint-restore-latest"), "OK");
   }
 
   /** 6b: cancel while a checkpoint is blocked, restart with no state (full replay). */
@@ -253,7 +265,7 @@ class TestIcebergSinkFailureScenarios {
   void s6bCancelDuringCheckpointNoState() throws Exception {
     cancelDuringCheckpoint();
     runToEnd(0, null, null, 0);
-    report("s6b-cancel-in-checkpoint-no-state");
+    expect(report("s6b-cancel-in-checkpoint-no-state"), "OK");
   }
 
   /** c1: an external full rewrite lands after the latest checkpoint, then restore it. */
@@ -300,7 +312,7 @@ class TestIcebergSinkFailureScenarios {
     String behind = runStaleThenCancel(false);
     compact(null);
     runToEnd(0, behind, null, 0);
-    expect(report("c3b-stale-commits-then-compaction", RECORDS), "LOUD");
+    expect(report("c3b-stale-commits-then-compaction", RECORDS), staleVerdict());
   }
 
   /** c3c: a compaction, then sink commits, both after the restored checkpoint. */
@@ -308,7 +320,7 @@ class TestIcebergSinkFailureScenarios {
   void c3cStaleRestoreCompactionThenCommits() throws Exception {
     String behind = runStaleThenCancel(true);
     runToEnd(0, behind, null, 0);
-    expect(report("c3c-stale-compaction-then-commits", RECORDS), "LOUD");
+    expect(report("c3c-stale-compaction-then-commits", RECORDS), staleVerdict());
   }
 
   /** c4: rows retired by DVs stay deleted when the rewrite drops them and the job restores. */
@@ -335,7 +347,7 @@ class TestIcebergSinkFailureScenarios {
     compact(null);
     expireAllButHead();
     runToEnd(0, behind, null, 0);
-    expect(report("c5-stale-compaction-expired", RECORDS), "LOUD");
+    expect(report("c5-stale-compaction-expired", RECORDS), staleVerdict());
   }
 
   /** c5a: as c1, then expire every snapshot but the head; reported, not asserted. */
@@ -356,6 +368,58 @@ class TestIcebergSinkFailureScenarios {
     runToEnd(0, latest, null, 0);
     System.out.printf("NOTE c6 DVs rewritten=%d%n", rewritten);
     expect(report("c6-dv-rewrite-after-latest", RECORDS), "OK");
+  }
+
+  /**
+   * p1: the commit of a checkpoint fails, another writer appends, and the job restores that
+   * checkpoint. Its results are not in the table, so a rebuild must refuse too.
+   */
+  @Test
+  void p1PendingResultsThenExternalAppend() throws Exception {
+    String pending = runUntilCommitFails(3);
+    appendExternalRow();
+    runToEnd(0, pending, null, 0);
+    expect(report("p1-pending-then-external-append", RECORDS), "LOUD");
+  }
+
+  /** p2: the commit of a checkpoint fails and the job restores it: committed once, nothing lost. */
+  @Test
+  void p2PendingResultsRestore() throws Exception {
+    String pending = runUntilCommitFails(3);
+    int snapshotsBefore = snapshotCount();
+    runToEnd(0, pending, null, 0);
+    System.out.printf("NOTE p2 snapshots before restore=%d%n", snapshotsBefore);
+    expect(report("p2-pending-restore", RECORDS), "OK");
+  }
+
+  private String staleVerdict() {
+    return "rebuild".equals(staleRestore) ? "OK" : "LOUD";
+  }
+
+  private String runUntilCommitFails(int commitAttempt) throws Exception {
+    AtomicInteger attempts = new AtomicInteger();
+    IcebergCommitter.setBeforeCommitAttempt(
+        checkpointId -> {
+          if (attempts.incrementAndGet() == commitAttempt) {
+            throw new IllegalStateException(
+                "Injected commit failure at checkpoint " + checkpointId);
+          }
+        });
+    try (Cluster cluster = new Cluster()) {
+      JobClient job = start(cluster, 0, null, null, 0);
+      awaitTerminal(job);
+      System.out.printf("NOTE commit failed, job %s%n", job.getJobStatus().get());
+      return latestCheckpoint(job.getJobID());
+    } finally {
+      IcebergCommitter.setBeforeCommitAttempt(checkpointId -> {});
+    }
+  }
+
+  private void appendExternalRow() throws IOException {
+    table.refresh();
+    new GenericAppenderHelper(table, FileFormat.PARQUET, compactionDir)
+        .appendToTable(ImmutableList.of(SimpleDataUtil.createRecord(1000, "external")));
+    externalRows.add("1000:external");
   }
 
   private String runHeldAt(int hold) throws Exception {
@@ -603,7 +667,9 @@ class TestIcebergSinkFailureScenarios {
           .set(FlinkMaintenanceConfig.RATE_LIMIT, "1")
           .set(FlinkMaintenanceConfig.LOCK_CHECK_DELAY, "1");
     } else if ("D".equals(mode)) {
-      builder.set(FlinkWriteOptions.UPSERT_MODE.key(), "index-dv");
+      builder
+          .set(FlinkWriteOptions.UPSERT_MODE.key(), "index-dv")
+          .set(FlinkWriteOptions.UPSERT_STALE_RESTORE.key(), staleRestore);
     }
 
     builder.append();
@@ -668,8 +734,8 @@ class TestIcebergSinkFailureScenarios {
 
   // ---------------------------------------------------------------------------------------------
 
-  private void report(String scenario) throws IOException {
-    report(scenario, RECORDS);
+  private String report(String scenario) throws IOException {
+    return report(scenario, RECORDS);
   }
 
   private String report(String scenario, int upTo) throws IOException {
@@ -710,8 +776,8 @@ class TestIcebergSinkFailureScenarios {
     System.out.printf(
         "RESULT scenario=%s mode=%s expected=%d actual=%d duplicates=%d unexpectedRows=%d "
             + "missing=%d duplicateKeys=%d eqDeleteFilesEver=%d eqDeleteFilesLive=%d dvsLive=%d "
-            + "danglingDvs=%d multiDvFiles=%d snapshots=%d rewritesApplied=%d rebasedDvs=%d verdict=%s "
-            + "jobFailures=%s%n",
+            + "danglingDvs=%d multiDvFiles=%d snapshots=%d rewritesApplied=%d rebasedDvs=%d "
+            + "staleRestore=%s rebuilds=%d rebuildMs=%d verdict=%s jobFailures=%s%n",
         scenario,
         mode,
         expected.size(),
@@ -728,6 +794,9 @@ class TestIcebergSinkFailureScenarios {
         snapshotCount(),
         IndexDvDataWriter.REWRITES_APPLIED.get(),
         IndexDvCommits.REBASED_DVS.get(),
+        staleRestore,
+        IndexDvDataWriter.REBUILDS.get(),
+        IndexDvDataWriter.LAST_REBUILD_MILLIS.get(),
         verdict,
         jobFailures);
     return verdict;
@@ -747,6 +816,8 @@ class TestIcebergSinkFailureScenarios {
 
       latest.forEach((k, i) -> rows.add(k + ":v" + i));
     }
+
+    rows.addAll(externalRows);
 
     return rows;
   }

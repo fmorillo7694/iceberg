@@ -97,6 +97,24 @@ public class FlinkWriteConf {
     };
   }
 
+  /** POC: whether an index-dv writer rebuilds its index when restored state is behind the table. */
+  public boolean upsertRebuildOnStaleRestore() {
+    String action =
+        confParser
+            .stringConf()
+            .option(FlinkWriteOptions.UPSERT_STALE_RESTORE.key())
+            .flinkConfig(FlinkWriteOptions.UPSERT_STALE_RESTORE)
+            .defaultValue(FlinkWriteOptions.UPSERT_STALE_RESTORE.defaultValue())
+            .parse();
+    return switch (action.toLowerCase(Locale.ROOT)) {
+      case "rebuild" -> true;
+      case "fail" -> false;
+      default ->
+          throw new IllegalArgumentException(
+              "Invalid upsert-stale-restore: " + action + ", expected 'fail' or 'rebuild'");
+    };
+  }
+
   public FileFormat dataFileFormat() {
     String valueAsString =
         confParser

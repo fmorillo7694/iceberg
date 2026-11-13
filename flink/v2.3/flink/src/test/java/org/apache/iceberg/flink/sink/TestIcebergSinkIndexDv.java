@@ -57,6 +57,7 @@ import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
+import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Snapshot;
@@ -301,6 +302,63 @@ class TestIcebergSinkIndexDv {
         .hasMessageContaining("the head is " + head)
         .hasMessageContaining("Start the job without state");
     assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(before);
+  }
+
+  @TestTemplate
+  void staleRestoreRebuildsIndexAtNewParallelism() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isNotEqualTo(DistributionMode.RANGE);
+    List<List<Row>> first = randomChangelog(3, 60, 40, 93);
+    List<List<Row>> second =
+        ImmutableList.<List<Row>>builder()
+            .addAll(randomChangelog(3, 60, 40, 94))
+            .add(ImmutableList.of(row("+I", 1000, "after")))
+            .build();
+    Table table = createTable("t_dv");
+
+    BatchesThenIdleSource.EMITTED_ALL.set(false);
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism, false);
+    DataStream<Row> input =
+        env.addSource(new BatchesThenIdleSource(first), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(input, table, INDEX_DV);
+    JobClient job = env.executeAsync("index-dv before external append");
+    awaitOrFail(job, BatchesThenIdleSource.EMITTED_ALL::get);
+    String savepoint =
+        job.stopWithSavepoint(false, savepointDir.toString(), SavepointFormatType.CANONICAL)
+            .get(60, TimeUnit.SECONDS);
+
+    Record external = SimpleDataUtil.createRecord(1000, "external");
+    PartitionKey externalPartition = new PartitionKey(table.spec(), table.schema());
+    externalPartition.partition(external);
+    new GenericAppenderHelper(table, FileFormat.PARQUET, compactionDir)
+        .appendToTable(
+            table.spec().isUnpartitioned() ? null : externalPartition, ImmutableList.of(external));
+
+    IndexDvDataWriter.REBUILDS.set(0);
+    Configuration restore = new Configuration();
+    restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
+    int rescaled = parallelism * 2;
+    StreamExecutionEnvironment restoredEnv = environment(restore, rescaled, false);
+    DataStream<Row> restoredInput =
+        restoredEnv
+            .addSource(new BoundedTestSource<>(second), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(
+        restoredInput,
+        table,
+        INDEX_DV,
+        rescaled,
+        ImmutableMap.of(FlinkWriteOptions.UPSERT_STALE_RESTORE.key(), "rebuild"),
+        false);
+    restoredEnv.execute("index-dv rebuild after rescale");
+
+    Map<Integer, String> state = Maps.newHashMap();
+    applyUpserts(state, first);
+    state.put(1000, "external");
+    assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(applyUpserts(state, second));
+    assertThat(IndexDvDataWriter.REBUILDS.get()).isEqualTo(rescaled);
+    assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
   }
 
   @TestTemplate

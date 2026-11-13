@@ -38,6 +38,8 @@ import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
+import org.apache.flink.runtime.state.VoidNamespace;
+import org.apache.flink.runtime.state.VoidNamespaceSerializer;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
@@ -108,6 +110,11 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
   @VisibleForTesting static final AtomicLong BOOTSTRAPPED_KEYS = new AtomicLong();
   @VisibleForTesting static final AtomicLong REWRITES_APPLIED = new AtomicLong();
   @VisibleForTesting static final AtomicLong RESTORES_PAST_HEAD = new AtomicLong();
+  @VisibleForTesting static final AtomicLong REBUILDS = new AtomicLong();
+  @VisibleForTesting static final AtomicLong LAST_REBUILD_MILLIS = new AtomicLong(-1);
+
+  private static final ValueStateDescriptor<Long> LOCATION =
+      new ValueStateDescriptor<>("index-dv-location", Types.LONG);
 
   private final TableLoader tableLoader;
   private final String branch;
@@ -117,6 +124,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
   private final long targetFileSize;
   private final Map<String, String> writeProperties;
   private final Long bootstrapSnapshotId;
+  private final boolean rebuildOnStaleRestore;
 
   private transient Table table;
   private transient PartitionSpec spec;
@@ -131,6 +139,10 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
   private transient ListState<byte[]> fileDictionaryState;
   private transient ListState<Long> lastSeenSnapshotState;
   private transient Long lastSeenSnapshotId;
+  // Data files this subtask wrote that no snapshot seen at a barrier has added yet; kept for a
+  // rebuild only.
+  private transient ListState<String> unconfirmedState;
+  private transient Set<String> unconfirmed;
   private transient Map<Integer, FileEntry> files;
   private transient Map<String, Integer> fileIds;
   private transient int subtaskIndex;
@@ -175,7 +187,8 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
       FileFormat format,
       long targetFileSize,
       Map<String, String> writeProperties,
-      Long bootstrapSnapshotId) {
+      Long bootstrapSnapshotId,
+      boolean rebuildOnStaleRestore) {
     this.tableLoader = tableLoader;
     this.branch = branch;
     this.flinkRowType = flinkRowType;
@@ -184,6 +197,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     this.targetFileSize = targetFileSize;
     this.writeProperties = writeProperties;
     this.bootstrapSnapshotId = bootstrapSnapshotId;
+    this.rebuildOnStaleRestore = rebuildOnStaleRestore;
   }
 
   @Override
@@ -216,10 +230,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     this.serializer = new StructLikeSerializer();
     this.dataWriters = StructLikeMap.create(spec.partitionType());
 
-    this.location =
-        context
-            .getKeyedStateStore()
-            .getState(new ValueStateDescriptor<>("index-dv-location", Types.LONG));
+    this.location = context.getKeyedStateStore().getState(LOCATION);
     this.fileDictionaryState =
         context
             .getOperatorStateStore()
@@ -251,92 +262,183 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
       lastSeenSnapshotId = lastSeenSnapshotId == null ? seen : Math.min(lastSeenSnapshotId, seen);
     }
 
+    this.unconfirmedState =
+        context
+            .getOperatorStateStore()
+            .getUnionListState(new ListStateDescriptor<>("index-dv-unconfirmed", Types.STRING));
+    this.unconfirmed = Sets.newHashSet(unconfirmedState.get());
+
     if (context.isRestored()) {
-      checkRestoredIndexIsCurrent();
+      reconcileRestoredIndex();
     } else {
-      bootstrap();
+      bootstrap(bootstrapSnapshotId);
       this.lastSeenSnapshotId = bootstrapSnapshotId;
     }
   }
 
   /**
-   * Fails when the table holds data files the restored index has never seen, which happens when the
+   * Checks that the restored index has seen every data file in the table, which fails when the
    * state is older than the table: an abandoned run or another job committed after it. Upserts from
-   * such an index would leave those rows live next to the new ones.
+   * such an index would leave those rows live next to the new ones. The job fails, or with {@code
+   * upsert-stale-restore=rebuild} the index is rebuilt from the head.
    *
    * <p>A data file is seen when the restored file dictionary knows it: bootstrapped, written by
    * this sink up to the restored checkpoint (committed or not), or registered by a rewrite. That
    * makes this sink's own commits after the restored head, such as the restored checkpoint
    * committed before its acknowledgement was lost, pass. Rewrites are reconciled at the next
-   * barrier and skipped here.
+   * barrier and skipped here; the rows they carry come from files added by snapshots that are
+   * checked, or that expiry removed, which breaks the history and fails the check.
    *
-   * <p>shortcut: fail-fast only; upgrade to a rebuild flag or a restore-time catch-up (#18717).
-   * Snapshots that only remove data files are not checked.
+   * <p>shortcut: snapshots that only remove data files are not checked.
    */
-  private void checkRestoredIndexIsCurrent() {
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
+  private void reconcileRestoredIndex() throws Exception {
     Snapshot head = table.snapshot(branch);
     if (head == null || (lastSeenSnapshotId != null && head.snapshotId() == lastSeenSnapshotId)) {
       return;
     }
 
-    int checked = 0;
-    for (Snapshot snapshot = head; ; checked++) {
-      if (!DataOperations.REPLACE.equals(snapshot.operation())) {
-        for (DataFile file :
-            SnapshotChanges.builderFor(table).snapshot(snapshot).build().addedDataFiles()) {
-          if (!fileIds.containsKey(file.location())) {
-            throw new IllegalStateException(
-                String.format(
-                    "Restored index-dv state is behind table %s branch %s: the index reflects"
-                        + " snapshot %s, the head is %s, and snapshot %s (operation %s, %s=%s,"
-                        + " %s=%s) added data file %s that the index has never seen. Upserts would"
-                        + " leave those rows live as duplicates. Start the job without state so"
-                        + " the index bootstraps from the head, or restore the checkpoint or"
-                        + " savepoint that matches the head.",
-                    table.name(),
-                    branch,
-                    lastSeenSnapshotId,
-                    head.snapshotId(),
-                    snapshot.snapshotId(),
-                    snapshot.operation(),
-                    SinkUtil.FLINK_JOB_ID,
-                    snapshot.summary().get(SinkUtil.FLINK_JOB_ID),
-                    SinkUtil.MAX_COMMITTED_CHECKPOINT_ID,
-                    snapshot.summary().get(SinkUtil.MAX_COMMITTED_CHECKPOINT_ID),
-                    file.location()));
+    Set<String> added = Sets.newHashSet();
+    Set<String> rewritten = Sets.newHashSet();
+    String stale = null;
+    int newer = 0;
+    boolean reachedLastSeen = false;
+    for (Snapshot snapshot = head; snapshot != null; newer++) {
+      boolean replace = DataOperations.REPLACE.equals(snapshot.operation());
+      if (!replace || rebuildOnStaleRestore) {
+        SnapshotChanges changes = SnapshotChanges.builderFor(table).snapshot(snapshot).build();
+        if (replace) {
+          changes.removedDataFiles().forEach(file -> rewritten.add(file.location()));
+        } else {
+          for (DataFile file : changes.addedDataFiles()) {
+            added.add(file.location());
+            if (stale == null && !fileIds.containsKey(file.location())) {
+              stale =
+                  String.format(
+                      "Restored index-dv state is behind table %s branch %s: the index reflects"
+                          + " snapshot %s, the head is %s, and snapshot %s (operation %s, %s=%s,"
+                          + " %s=%s) added data file %s that the index has never seen. Upserts"
+                          + " would leave those rows live as duplicates.",
+                      table.name(),
+                      branch,
+                      lastSeenSnapshotId,
+                      head.snapshotId(),
+                      snapshot.snapshotId(),
+                      snapshot.operation(),
+                      SinkUtil.FLINK_JOB_ID,
+                      snapshot.summary().get(SinkUtil.FLINK_JOB_ID),
+                      SinkUtil.MAX_COMMITTED_CHECKPOINT_ID,
+                      snapshot.summary().get(SinkUtil.MAX_COMMITTED_CHECKPOINT_ID),
+                      file.location());
+            }
           }
         }
       }
 
+      if (stale != null && !rebuildOnStaleRestore) {
+        break;
+      }
+
       Long parentId = snapshot.parentId();
       if (parentId != null && parentId.equals(lastSeenSnapshotId)) {
-        LOG.info(
-            "Restored index-dv state on subtask {} reflects snapshot {}; the {} newer snapshot(s) up"
-                + " to head {} add only data files the index knows",
-            subtaskIndex,
-            lastSeenSnapshotId,
-            checked + 1,
-            head.snapshotId());
-        RESTORES_PAST_HEAD.incrementAndGet();
-        return;
+        reachedLastSeen = true;
+        break;
       }
 
-      Snapshot parent = parentId == null ? null : table.snapshot(parentId);
-      if (parent == null) {
-        Preconditions.checkState(
-            lastSeenSnapshotId == null,
-            "Cannot verify restored index-dv state for table %s branch %s: snapshot %s, which the"
-                + " index reflects, is not an ancestor of head %s or its history was expired."
-                + " Start the job without state so the index bootstraps from the head.",
-            table.name(),
-            branch,
-            lastSeenSnapshotId,
-            head.snapshotId());
-        return;
-      }
-
-      snapshot = parent;
+      snapshot = parentId == null ? null : table.snapshot(parentId);
     }
+
+    if (stale == null && lastSeenSnapshotId != null && !reachedLastSeen) {
+      stale =
+          String.format(
+              "Cannot verify restored index-dv state for table %s branch %s: snapshot %s, which"
+                  + " the index reflects, is not an ancestor of head %s or its history was"
+                  + " expired.",
+              table.name(), branch, lastSeenSnapshotId, head.snapshotId());
+    }
+
+    if (stale == null) {
+      LOG.info(
+          "Restored index-dv state on subtask {} reflects snapshot {}; the {} newer snapshot(s) up"
+              + " to head {} add only data files the index knows",
+          subtaskIndex,
+          lastSeenSnapshotId,
+          newer + 1,
+          head.snapshotId());
+      RESTORES_PAST_HEAD.incrementAndGet();
+      return;
+    }
+
+    if (!rebuildOnStaleRestore) {
+      throw new IllegalStateException(
+          stale
+              + " Start the job without state so the index bootstraps from the head, restore the"
+              + " checkpoint or savepoint that matches the head, or set"
+              + " upsert-stale-restore=rebuild.");
+    }
+
+    rebuild(head, stale, added, rewritten);
+  }
+
+  /**
+   * Discards the restored index and indexes the live rows of the head instead.
+   *
+   * <p>Refused while the restored state holds results this sink wrote that the table does not hold:
+   * the restored committer would commit them after the rebuild, with deletes resolved against the
+   * stale index and rows the rebuilt index has not seen.
+   */
+  private void rebuild(Snapshot head, String stale, Set<String> added, Set<String> rewritten)
+      throws Exception {
+    Set<String> uncommitted = Sets.newHashSet(unconfirmed);
+    uncommitted.removeAll(added);
+    uncommitted.removeAll(rewritten);
+    if (!uncommitted.isEmpty()) {
+      try (CloseableIterable<FileScanTask> tasks =
+          table.newScan().useSnapshot(head.snapshotId()).planFiles()) {
+        for (FileScanTask task : tasks) {
+          uncommitted.remove(task.file().location());
+        }
+      }
+    }
+
+    Preconditions.checkState(
+        uncommitted.isEmpty(),
+        "%s Cannot rebuild the index: the restored state holds %s data file(s) this sink wrote"
+            + " that table %s does not hold, for example %s, and the restored committer would"
+            + " commit them over the rebuilt index. Restore the checkpoint or savepoint that"
+            + " matches the head, or start the job without state.",
+        stale,
+        uncommitted.size(),
+        table.name(),
+        uncommitted.isEmpty() ? null : uncommitted.iterator().next());
+
+    Long restored = lastSeenSnapshotId;
+    long start = System.currentTimeMillis();
+    this.<SerializedEqualityValues>getKeyedStateBackend()
+        .applyToAllKeys(
+            VoidNamespace.INSTANCE,
+            VoidNamespaceSerializer.INSTANCE,
+            LOCATION,
+            (key, state) -> state.clear());
+    files.clear();
+    fileIds.clear();
+    this.nextFileCounter = 0;
+    long keys = bootstrap(head.snapshotId());
+    this.lastSeenSnapshotId = head.snapshotId();
+    long millis = System.currentTimeMillis() - start;
+    REBUILDS.incrementAndGet();
+    LAST_REBUILD_MILLIS.accumulateAndGet(millis, Math::max);
+    LOG.warn(
+        "Rebuilt the index-dv index on subtask {} from head {} of table {} branch {}: {} keys in {}"
+            + " ms, discarding the restored index, which reflected snapshot {}. {}",
+        subtaskIndex,
+        head.snapshotId(),
+        table.name(),
+        branch,
+        keys,
+        millis,
+        restored,
+        stale);
   }
 
   @Override
@@ -415,15 +517,15 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
    * groups; upgrade to a split read with a shuffle, incremental catch-up (#18717) or a shared index
    * extract (#16961).
    */
-  private void bootstrap() throws IOException {
-    if (bootstrapSnapshotId == null) {
-      return;
+  private long bootstrap(Long snapshotId) throws IOException {
+    if (snapshotId == null) {
+      return 0;
     }
 
     long start = System.currentTimeMillis();
     long[] keys = {0};
     try (CloseableIterable<FileScanTask> tasks =
-        table.newScan().useSnapshot(bootstrapSnapshotId).planFiles()) {
+        table.newScan().useSnapshot(snapshotId).planFiles()) {
       for (FileScanTask task : tasks) {
         DataFile file = task.file();
         for (DeleteFile delete : task.deletes()) {
@@ -448,6 +550,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     LAST_BOOTSTRAP_MILLIS.accumulateAndGet(millis, Math::max);
     BOOTSTRAPPED_KEYS.addAndGet(keys[0]);
     LOG.info("Bootstrapped {} keys on subtask {} in {} ms", keys[0], subtaskIndex, millis);
+    return keys[0];
   }
 
   /**
@@ -520,6 +623,14 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
 
     for (Snapshot snapshot : newer) {
       if (!DataOperations.REPLACE.equals(snapshot.operation())) {
+        if (rebuildOnStaleRestore && !unconfirmed.isEmpty()) {
+          SnapshotChanges.builderFor(table)
+              .snapshot(snapshot)
+              .build()
+              .addedDataFiles()
+              .forEach(file -> unconfirmed.remove(file.location()));
+        }
+
         continue;
       }
 
@@ -589,6 +700,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     fileDictionaryState.update(encoded);
     lastSeenSnapshotState.update(
         lastSeenSnapshotId != null ? ImmutableList.of(lastSeenSnapshotId) : ImmutableList.of());
+    unconfirmedState.update(Lists.newArrayList(unconfirmed));
   }
 
   @Override
@@ -609,6 +721,10 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     }
 
     dataWriters.clear();
+    if (rebuildOnStaleRestore) {
+      dataFiles.forEach(file -> unconfirmed.add(file.location()));
+    }
+
     output.collect(
         new StreamRecord<>(
             new FlinkWriteResult(

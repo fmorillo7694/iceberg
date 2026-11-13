@@ -115,7 +115,8 @@ class IndexDvTopology {
                     conf.dataFileFormat(),
                     conf.targetDataFileSize(),
                     writeProperties,
-                    bootstrapSnapshotId))
+                    bootstrapSnapshotId,
+                    conf.upsertRebuildOnStaleRestore()))
             .setParallelism(writerParallelism);
     SingleOutputStreamOperator<FlinkWriteResult> dvStream =
         dataStream
@@ -124,7 +125,11 @@ class IndexDvTopology {
             .transform(
                 name + "-index-dv-delete-writer",
                 TypeInformation.of(FlinkWriteResult.class),
-                new IndexDvDeleteWriter(tableLoader, bootstrapSnapshotId))
+                new IndexDvDeleteWriter(
+                    tableLoader,
+                    conf.branch(),
+                    bootstrapSnapshotId,
+                    conf.upsertRebuildOnStaleRestore()))
             .setParallelism(writerParallelism);
     if (uidPrefix != null) {
       dataStream = dataStream.uid(uidPrefix + "-index-dv-writer");

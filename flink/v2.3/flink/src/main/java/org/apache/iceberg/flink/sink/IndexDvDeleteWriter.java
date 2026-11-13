@@ -28,6 +28,8 @@ import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.StateInitializationContext;
+import org.apache.flink.runtime.state.VoidNamespace;
+import org.apache.flink.runtime.state.VoidNamespaceSerializer;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
@@ -38,6 +40,7 @@ import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.BaseDeleteLoader;
@@ -66,7 +69,9 @@ class IndexDvDeleteWriter extends AbstractStreamOperator<FlinkWriteResult>
   @VisibleForTesting static final AtomicLong DVS_WRITTEN = new AtomicLong();
 
   private final TableLoader tableLoader;
+  private final String branch;
   private final Long bootstrapSnapshotId;
+  private final boolean rebuildOnRestore;
 
   private transient Table table;
   private transient Map<Integer, PartitionSpec> specs;
@@ -77,9 +82,12 @@ class IndexDvDeleteWriter extends AbstractStreamOperator<FlinkWriteResult>
   private transient Map<String, StructLike> partitions;
   private transient boolean inputEnded;
 
-  IndexDvDeleteWriter(TableLoader tableLoader, Long bootstrapSnapshotId) {
+  IndexDvDeleteWriter(
+      TableLoader tableLoader, String branch, Long bootstrapSnapshotId, boolean rebuildOnRestore) {
     this.tableLoader = tableLoader;
+    this.branch = branch;
     this.bootstrapSnapshotId = bootstrapSnapshotId;
+    this.rebuildOnRestore = rebuildOnRestore;
   }
 
   @Override
@@ -98,25 +106,38 @@ class IndexDvDeleteWriter extends AbstractStreamOperator<FlinkWriteResult>
             .build();
     this.deleteLoader = new BaseDeleteLoader(file -> table.io().newInputFile(file));
     this.partitions = Maps.newHashMap();
-    this.lastDv =
-        context
-            .getKeyedStateStore()
-            .getState(
-                new ValueStateDescriptor<>(
-                    "index-dv-last-dv", PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    if (!context.isRestored() && bootstrapSnapshotId != null) {
-      bootstrapDvs();
+    ValueStateDescriptor<byte[]> lastDvDescriptor =
+        new ValueStateDescriptor<>(
+            "index-dv-last-dv", PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO);
+    this.lastDv = context.getKeyedStateStore().getState(lastDvDescriptor);
+    if (!context.isRestored()) {
+      if (bootstrapSnapshotId != null) {
+        bootstrapDvs(table.snapshot(bootstrapSnapshotId));
+      }
+    } else if (rebuildOnRestore) {
+      // The data writer may rebuild its index from the head, so start from the head's DVs too.
+      // Safe without a rebuild as well: the committer merges every DV with its file's live DV.
+      getKeyedStateBackend()
+          .applyToAllKeys(
+              VoidNamespace.INSTANCE,
+              VoidNamespaceSerializer.INSTANCE,
+              lastDvDescriptor,
+              (key, state) -> state.clear());
+      Snapshot head = table.snapshot(branch);
+      if (head != null) {
+        bootstrapDvs(head);
+      }
     }
   }
 
-  private void bootstrapDvs() throws IOException {
+  private void bootstrapDvs(Snapshot snapshot) throws IOException {
     int maxParallelism = getRuntimeContext().getTaskInfo().getMaxNumberOfParallelSubtasks();
     KeyGroupRange ownedKeyGroups =
         KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(
             maxParallelism,
             getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks(),
             getRuntimeContext().getTaskInfo().getIndexOfThisSubtask());
-    for (ManifestFile manifest : table.snapshot(bootstrapSnapshotId).deleteManifests(table.io())) {
+    for (ManifestFile manifest : snapshot.deleteManifests(table.io())) {
       try (ManifestReader<DeleteFile> reader =
           ManifestFiles.readDeleteManifest(manifest, table.io(), specs)) {
         for (DeleteFile file : reader) {

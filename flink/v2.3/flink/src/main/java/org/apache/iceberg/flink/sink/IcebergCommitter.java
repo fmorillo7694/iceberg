@@ -27,6 +27,7 @@ import java.util.NavigableMap;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongConsumer;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.core.io.SimpleVersionedSerialization;
 import org.apache.iceberg.AppendFiles;
@@ -60,6 +61,9 @@ import org.slf4j.LoggerFactory;
  */
 class IcebergCommitter implements Committer<IcebergCommittable> {
   private static final Logger LOG = LoggerFactory.getLogger(IcebergCommitter.class);
+
+  // POC: runs right before every table commit attempt, with the checkpoint id; tests only.
+  private static volatile LongConsumer beforeCommitAttempt = checkpointId -> {};
   private static final byte[] EMPTY_MANIFEST_DATA = new byte[0];
   public static final WriteResult EMPTY_WRITE_RESULT =
       WriteResult.builder()
@@ -158,6 +162,11 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
     }
 
     this.continuousEmptyCheckpoints = 0;
+  }
+
+  @VisibleForTesting
+  static void setBeforeCommitAttempt(LongConsumer hook) {
+    beforeCommitAttempt = hook;
   }
 
   @Override
@@ -378,6 +387,7 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
     operation.set(SinkUtil.OPERATOR_ID, operatorId);
     operation.toBranch(branch);
 
+    beforeCommitAttempt.accept(checkpointId);
     long startNano = System.nanoTime();
     operation.commit(); // abort is automatically called if this fails.
     long durationMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNano);

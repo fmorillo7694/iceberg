@@ -46,6 +46,7 @@ import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.StateBackendOptions;
+import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.core.execution.JobClient;
@@ -72,12 +73,14 @@ import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.GenericAppenderHelper;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.flink.FlinkWriteOptions;
@@ -87,6 +90,7 @@ import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.TestFixtures;
 import org.apache.iceberg.flink.maintenance.api.FlinkMaintenanceConfig;
+import org.apache.iceberg.flink.source.BoundedTestSource;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -815,6 +819,150 @@ class IndexDvScaleBenchmark {
       if (targetCheckpoint >= 0 && checkpointId >= targetCheckpoint) {
         this.phaseDone = true;
       }
+    }
+  }
+
+  /**
+   * Measures a rebuild after a stale restore: loads {@code INDEX_DV_REBUILD_KEYS} keys, upserts
+   * with index-dv, stops with a savepoint, appends one row from another writer, and restores with
+   * {@code upsert-stale-restore=rebuild}.
+   */
+  @Test
+  void staleRestoreRebuild() throws Exception {
+    String keysEnv = System.getenv("INDEX_DV_REBUILD_KEYS");
+    assumeThat(keysEnv).isNotNull();
+    int keys = Integer.parseInt(keysEnv);
+    String name = "rebuild_" + keys;
+    Table table =
+        CATALOG_EXTENSION
+            .catalog()
+            .createTable(
+                TableIdentifier.of(DATABASE, name),
+                SimpleDataUtil.SCHEMA,
+                PartitionSpec.unpartitioned(),
+                ImmutableMap.of(
+                    TableProperties.FORMAT_VERSION,
+                    "3",
+                    TableProperties.WRITE_TARGET_FILE_SIZE_BYTES,
+                    String.valueOf(TARGET_FILE_SIZE)));
+    loadAppendOnly(name, keys);
+
+    IndexDvDataWriter.LAST_BOOTSTRAP_MILLIS.set(-1);
+    UpsertsThenIdleSource.EMITTED.set(false);
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(PARALLELISM);
+    env.setMaxParallelism(128);
+    env.enableCheckpointing(CHECKPOINT_INTERVAL_MS);
+    rebuildSink(
+        env.addSource(new UpsertsThenIdleSource(keys), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source")
+            .setParallelism(1),
+        name);
+    JobClient job = env.executeAsync("before rebuild " + name);
+    awaitFlag(job, UpsertsThenIdleSource.EMITTED);
+    String savepoint =
+        job.stopWithSavepoint(false, savepointDir.toString(), SavepointFormatType.NATIVE)
+            .get(600, TimeUnit.SECONDS);
+    long bootstrapMillis = IndexDvDataWriter.LAST_BOOTSTRAP_MILLIS.get();
+
+    table.refresh();
+    new GenericAppenderHelper(table, FileFormat.PARQUET, savepointDir.resolve("external"))
+        .appendToTable(ImmutableList.of(SimpleDataUtil.createRecord(keys, "external")));
+
+    IndexDvDataWriter.REBUILDS.set(0);
+    IndexDvDataWriter.LAST_REBUILD_MILLIS.set(-1);
+    Configuration restore = new Configuration();
+    restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
+    StreamExecutionEnvironment restoredEnv =
+        StreamExecutionEnvironment.getExecutionEnvironment(restore);
+    restoredEnv.setParallelism(PARALLELISM);
+    restoredEnv.setMaxParallelism(128);
+    restoredEnv.enableCheckpointing(CHECKPOINT_INTERVAL_MS);
+    rebuildSink(
+        restoredEnv
+            .addSource(
+                new BoundedTestSource<>(
+                    ImmutableList.of(
+                        ImmutableList.of(Row.ofKind(RowKind.UPDATE_AFTER, keys, "after")))),
+                TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source")
+            .setParallelism(1),
+        name);
+    long start = System.nanoTime();
+    restoredEnv.execute("after rebuild " + name);
+    long restoredJobMillis = (System.nanoTime() - start) / 1_000_000;
+
+    table.refresh();
+    long rows = countRows(table);
+    System.out.printf(
+        "REBUILD keys=%d bootstrapMs=%d rebuildMs=%d rebuilds=%d restoredJobMs=%d rows=%d"
+            + " expectedRows=%d%n",
+        keys,
+        bootstrapMillis,
+        IndexDvDataWriter.LAST_REBUILD_MILLIS.get(),
+        IndexDvDataWriter.REBUILDS.get(),
+        restoredJobMillis,
+        rows,
+        keys + 1);
+    assertThat(IndexDvDataWriter.REBUILDS.get()).isEqualTo(PARALLELISM);
+    assertThat(rows).isEqualTo(keys + 1);
+  }
+
+  private static void rebuildSink(DataStream<Row> input, String name) {
+    IcebergSink.forRow(input, SimpleDataUtil.FLINK_SCHEMA)
+        .tableLoader(loader(name))
+        .writeParallelism(PARALLELISM)
+        .equalityFieldColumns(ImmutableList.of("id"))
+        .upsert(true)
+        .uidSuffix("rebuild")
+        .set(FlinkWriteOptions.UPSERT_MODE.key(), "index-dv")
+        .set(FlinkWriteOptions.UPSERT_STALE_RESTORE.key(), "rebuild")
+        .append();
+  }
+
+  /** Emits one upsert per key in the first hundredth of the keys, then idles until cancelled. */
+  private static class UpsertsThenIdleSource implements SourceFunction<Row>, CheckpointListener {
+    private static final AtomicBoolean EMITTED = new AtomicBoolean();
+
+    private final int keys;
+    private final AtomicInteger completedCheckpoints = new AtomicInteger();
+    private volatile boolean running = true;
+
+    UpsertsThenIdleSource(int keys) {
+      this.keys = keys;
+    }
+
+    @Override
+    public void run(SourceContext<Row> ctx) throws Exception {
+      awaitCheckpoints(1);
+      synchronized (ctx.getCheckpointLock()) {
+        for (int id = 0; id < keys / 100; id++) {
+          ctx.collect(Row.ofKind(RowKind.UPDATE_AFTER, id, "updated-" + id));
+        }
+      }
+
+      awaitCheckpoints(2);
+      EMITTED.set(true);
+      while (running) {
+        Thread.sleep(10);
+      }
+    }
+
+    private void awaitCheckpoints(int count) throws InterruptedException {
+      int target = completedCheckpoints.get() + count;
+      while (running && completedCheckpoints.get() < target) {
+        Thread.sleep(5);
+      }
+    }
+
+    @Override
+    public void cancel() {
+      this.running = false;
+    }
+
+    @Override
+    public void notifyCheckpointComplete(long checkpointId) {
+      completedCheckpoints.incrementAndGet();
     }
   }
 

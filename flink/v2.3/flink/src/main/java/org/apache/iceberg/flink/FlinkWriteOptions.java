@@ -62,6 +62,10 @@ public class FlinkWriteOptions {
   public static final ConfigOption<String> UPSERT_MODE =
       ConfigOptions.key("upsert-mode").stringType().defaultValue("equality-delete");
 
+  // POC: what an index-dv writer does when restored state is behind the table; "fail" or "rebuild"
+  public static final ConfigOption<String> UPSERT_STALE_RESTORE =
+      ConfigOptions.key("upsert-stale-restore").stringType().defaultValue("fail");
+
   public static final ConfigOption<Boolean> OVERWRITE_MODE =
       ConfigOptions.key("overwrite-enabled").booleanType().defaultValue(false);
 
