@@ -107,6 +107,7 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
   @VisibleForTesting static final AtomicLong LAST_BOOTSTRAP_MILLIS = new AtomicLong(-1);
   @VisibleForTesting static final AtomicLong BOOTSTRAPPED_KEYS = new AtomicLong();
   @VisibleForTesting static final AtomicLong REWRITES_APPLIED = new AtomicLong();
+  @VisibleForTesting static final AtomicLong RESTORES_PAST_HEAD = new AtomicLong();
 
   private final TableLoader tableLoader;
   private final String branch;
@@ -250,9 +251,91 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
       lastSeenSnapshotId = lastSeenSnapshotId == null ? seen : Math.min(lastSeenSnapshotId, seen);
     }
 
-    if (!context.isRestored()) {
+    if (context.isRestored()) {
+      checkRestoredIndexIsCurrent();
+    } else {
       bootstrap();
       this.lastSeenSnapshotId = bootstrapSnapshotId;
+    }
+  }
+
+  /**
+   * Fails when the table holds data files the restored index has never seen, which happens when the
+   * state is older than the table: an abandoned run or another job committed after it. Upserts from
+   * such an index would leave those rows live next to the new ones.
+   *
+   * <p>A data file is seen when the restored file dictionary knows it: bootstrapped, written by
+   * this sink up to the restored checkpoint (committed or not), or registered by a rewrite. That
+   * makes this sink's own commits after the restored head, such as the restored checkpoint
+   * committed before its acknowledgement was lost, pass. Rewrites are reconciled at the next
+   * barrier and skipped here.
+   *
+   * <p>shortcut: fail-fast only; upgrade to a rebuild flag or a restore-time catch-up (#18717).
+   * Snapshots that only remove data files are not checked.
+   */
+  private void checkRestoredIndexIsCurrent() {
+    Snapshot head = table.snapshot(branch);
+    if (head == null || (lastSeenSnapshotId != null && head.snapshotId() == lastSeenSnapshotId)) {
+      return;
+    }
+
+    int checked = 0;
+    for (Snapshot snapshot = head; ; checked++) {
+      if (!DataOperations.REPLACE.equals(snapshot.operation())) {
+        for (DataFile file :
+            SnapshotChanges.builderFor(table).snapshot(snapshot).build().addedDataFiles()) {
+          if (!fileIds.containsKey(file.location())) {
+            throw new IllegalStateException(
+                String.format(
+                    "Restored index-dv state is behind table %s branch %s: the index reflects"
+                        + " snapshot %s, the head is %s, and snapshot %s (operation %s, %s=%s,"
+                        + " %s=%s) added data file %s that the index has never seen. Upserts would"
+                        + " leave those rows live as duplicates. Start the job without state so"
+                        + " the index bootstraps from the head, or restore the checkpoint or"
+                        + " savepoint that matches the head.",
+                    table.name(),
+                    branch,
+                    lastSeenSnapshotId,
+                    head.snapshotId(),
+                    snapshot.snapshotId(),
+                    snapshot.operation(),
+                    SinkUtil.FLINK_JOB_ID,
+                    snapshot.summary().get(SinkUtil.FLINK_JOB_ID),
+                    SinkUtil.MAX_COMMITTED_CHECKPOINT_ID,
+                    snapshot.summary().get(SinkUtil.MAX_COMMITTED_CHECKPOINT_ID),
+                    file.location()));
+          }
+        }
+      }
+
+      Long parentId = snapshot.parentId();
+      if (parentId != null && parentId.equals(lastSeenSnapshotId)) {
+        LOG.info(
+            "Restored index-dv state on subtask {} reflects snapshot {}; the {} newer snapshot(s) up"
+                + " to head {} add only data files the index knows",
+            subtaskIndex,
+            lastSeenSnapshotId,
+            checked + 1,
+            head.snapshotId());
+        RESTORES_PAST_HEAD.incrementAndGet();
+        return;
+      }
+
+      Snapshot parent = parentId == null ? null : table.snapshot(parentId);
+      if (parent == null) {
+        Preconditions.checkState(
+            lastSeenSnapshotId == null,
+            "Cannot verify restored index-dv state for table %s branch %s: snapshot %s, which the"
+                + " index reflects, is not an ancestor of head %s or its history was expired."
+                + " Start the job without state so the index bootstraps from the head.",
+            table.name(),
+            branch,
+            lastSeenSnapshotId,
+            head.snapshotId());
+        return;
+      }
+
+      snapshot = parent;
     }
   }
 

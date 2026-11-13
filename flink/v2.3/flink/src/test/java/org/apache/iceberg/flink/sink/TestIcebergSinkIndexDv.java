@@ -20,6 +20,7 @@ package org.apache.iceberg.flink.sink;
 
 import static org.apache.iceberg.flink.TestFixtures.DATABASE;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.IOException;
@@ -236,6 +237,7 @@ class TestIcebergSinkIndexDv {
             .get(60, TimeUnit.SECONDS);
 
     IndexDvDataWriter.BOOTSTRAPPED_KEYS.set(0);
+    IndexDvDataWriter.RESTORES_PAST_HEAD.set(0);
     Configuration restore = new Configuration();
     restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
     int rescaled = parallelism * 2;
@@ -251,8 +253,54 @@ class TestIcebergSinkIndexDv {
     applyUpserts(state, first);
     assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(applyUpserts(state, second));
     assertThat(IndexDvDataWriter.BOOTSTRAPPED_KEYS.get()).isZero();
+    assertThat(IndexDvDataWriter.RESTORES_PAST_HEAD.get()).isPositive();
     assertThat(writerSubtasksOfLiveFiles(table)).contains(rescaled - 1);
     assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
+  }
+
+  @TestTemplate
+  void restoreFailsWhenTableHasCommitsTheIndexHasNotSeen() throws Exception {
+    assumeThat(parallelism).isEqualTo(2);
+    assumeThat(distributionMode).isEqualTo(DistributionMode.NONE);
+    assumeThat(partitioned).isFalse();
+    List<List<Row>> first = randomChangelog(3, 60, 40, 91);
+    Table table = createTable("t_dv");
+
+    BatchesThenIdleSource.EMITTED_ALL.set(false);
+    StreamExecutionEnvironment env = environment(new Configuration(), parallelism, false);
+    DataStream<Row> input =
+        env.addSource(new BatchesThenIdleSource(first), TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(input, table, INDEX_DV);
+    JobClient job = env.executeAsync("index-dv before external append");
+    awaitOrFail(job, BatchesThenIdleSource.EMITTED_ALL::get);
+    String savepoint =
+        job.stopWithSavepoint(false, savepointDir.toString(), SavepointFormatType.CANONICAL)
+            .get(60, TimeUnit.SECONDS);
+
+    new GenericAppenderHelper(table, FileFormat.PARQUET, compactionDir)
+        .appendToTable(ImmutableList.of(SimpleDataUtil.createRecord(1, "external")));
+    long head = table.currentSnapshot().snapshotId();
+    List<String> before = liveRows(table);
+
+    Configuration restore = new Configuration();
+    restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
+    StreamExecutionEnvironment restoredEnv = environment(restore, parallelism, false);
+    DataStream<Row> restoredInput =
+        restoredEnv
+            .addSource(
+                new BoundedTestSource<>(ImmutableList.of(ImmutableList.of(row("+I", 1, "after")))),
+                TestFlinkIcebergSinkV2Base.ROW_TYPE_INFO)
+            .uid("source");
+    sink(restoredInput, table, INDEX_DV);
+
+    assertThatThrownBy(() -> restoredEnv.execute("index-dv after external append"))
+        .rootCause()
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Restored index-dv state is behind table")
+        .hasMessageContaining("the head is " + head)
+        .hasMessageContaining("Start the job without state");
+    assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(before);
   }
 
   @TestTemplate
