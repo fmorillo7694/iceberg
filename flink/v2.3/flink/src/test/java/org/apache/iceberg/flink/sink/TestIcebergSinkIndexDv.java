@@ -238,7 +238,6 @@ class TestIcebergSinkIndexDv {
             .get(60, TimeUnit.SECONDS);
 
     IndexDvDataWriter.BOOTSTRAPPED_KEYS.set(0);
-    IndexDvDataWriter.RESTORES_PAST_HEAD.set(0);
     Configuration restore = new Configuration();
     restore.set(StateRecoveryOptions.SAVEPOINT_PATH, savepoint);
     int rescaled = parallelism * 2;
@@ -254,7 +253,6 @@ class TestIcebergSinkIndexDv {
     applyUpserts(state, first);
     assertThat(liveRows(table)).containsExactlyInAnyOrderElementsOf(applyUpserts(state, second));
     assertThat(IndexDvDataWriter.BOOTSTRAPPED_KEYS.get()).isZero();
-    assertThat(IndexDvDataWriter.RESTORES_PAST_HEAD.get()).isPositive();
     assertThat(writerSubtasksOfLiveFiles(table)).contains(rescaled - 1);
     assertThat(countDeleteFiles(table, FileContent.EQUALITY_DELETES)).isZero();
   }

@@ -64,6 +64,8 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
 
   // POC: runs right before every table commit attempt, with the checkpoint id; tests only.
   private static volatile LongConsumer beforeCommitAttempt = checkpointId -> {};
+  // POC: runs when a commit of restored or new results starts, before any table read; tests only.
+  private static volatile LongConsumer beforeCommitRequests = checkpointId -> {};
   private static final byte[] EMPTY_MANIFEST_DATA = new byte[0];
   public static final WriteResult EMPTY_WRITE_RESULT =
       WriteResult.builder()
@@ -169,6 +171,11 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
     beforeCommitAttempt = hook;
   }
 
+  @VisibleForTesting
+  static void setBeforeCommitRequests(LongConsumer hook) {
+    beforeCommitRequests = hook;
+  }
+
   @Override
   public void commit(Collection<CommitRequest<IcebergCommittable>> commitRequests)
       throws IOException, InterruptedException {
@@ -186,6 +193,8 @@ class IcebergCommitter implements Committer<IcebergCommittable> {
     for (CommitRequest<IcebergCommittable> request : commitRequests) {
       commitRequestMap.put(request.getCommittable().checkpointId(), request);
     }
+
+    beforeCommitRequests.accept(commitRequestMap.lastKey());
 
     IcebergCommittable last = commitRequestMap.lastEntry().getValue().getCommittable();
     // A stateless start has no committed checkpoints; the table's mark would drop every commit.

@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
@@ -34,6 +35,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.functions.MapFunction;
@@ -75,6 +77,7 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.actions.SizeBasedFileRewritePlanner;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.BaseDeleteLoader;
 import org.apache.iceberg.data.DeleteLoader;
@@ -89,9 +92,11 @@ import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.TestFixtures;
 import org.apache.iceberg.flink.maintenance.api.FlinkMaintenanceConfig;
+import org.apache.iceberg.flink.maintenance.api.RewriteDataFilesConfig;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -122,13 +127,19 @@ class TestIcebergSinkFailureScenarios {
   private static final int BATCH = 40;
   private static final long CHECKPOINT_INTERVAL_MS = 200L;
   private static final int CHECKPOINTS_TO_COMMIT = 3;
+  private static final long REWRITE_PAUSE_MS = 500L;
 
   @TempDir private Path checkpointDir;
   @TempDir private Path savepointDir;
   @TempDir private Path compactionDir;
 
+  private static final AtomicInteger REWRITES = new AtomicInteger();
+  private static final List<String> REWRITE_FAILURES =
+      Collections.synchronizedList(Lists.newArrayList());
+
   private String mode;
   private String staleRestore;
+  private boolean inJobRewrite;
   private Table table;
   private final Set<String> externalRows = Sets.newHashSet();
   private final List<String> jobFailures = Lists.newArrayList();
@@ -151,11 +162,15 @@ class TestIcebergSinkFailureScenarios {
     IndexDvDataWriter.REBUILDS.set(0);
     IndexDvDataWriter.LAST_REBUILD_MILLIS.set(-1);
     IndexDvCommits.REBASED_DVS.set(0);
+    IndexDvCommits.RETRIES.set(0);
+    REWRITES.set(0);
+    REWRITE_FAILURES.clear();
   }
 
   @AfterEach
   void after() {
     IcebergCommitter.setBeforeCommitAttempt(checkpointId -> {});
+    IcebergCommitter.setBeforeCommitRequests(checkpointId -> {});
   }
 
   /** 1: failover to the latest checkpoint while input keeps flowing. */
@@ -392,6 +407,215 @@ class TestIcebergSinkFailureScenarios {
     expect(report("p2-pending-restore", RECORDS), "OK");
   }
 
+  /** k1a: a full rewrite lands after checkpoint N's results are prepared, before its commit. */
+  @Test
+  void k1aRewriteBeforeCommitStarts() throws Exception {
+    onCommitRequests(ImmutableSet.of(3, 6), () -> compact(null));
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k1a-full-rewrite-before-commit"), "OK");
+  }
+
+  /** k1b: as k1a, rewriting one bucket of a bucket(id, 3) table. */
+  @Test
+  void k1bPartialRewriteBeforeCommitStarts() throws Exception {
+    recreateBucketed();
+    onCommitRequests(ImmutableSet.of(3, 6), () -> compact(0));
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k1b-partial-rewrite-before-commit"), "OK");
+  }
+
+  /** k1c: as k1a, rewriting every live DV into new DV files. */
+  @Test
+  void k1cDvRewriteBeforeCommitStarts() throws Exception {
+    onCommitRequests(ImmutableSet.of(4, 7), () -> rewriteDvs() > 0);
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k1c-dv-rewrite-before-commit"), "OK");
+  }
+
+  /** k2a: a full rewrite commits after the sink built its commit and right before it commits. */
+  @Test
+  void k2aRewriteRacesCommit() throws Exception {
+    onCommitAttempts(ImmutableSet.of(3, 7), () -> compact(null));
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k2a-full-rewrite-races-commit"), "OK");
+  }
+
+  /** k2b: as k2a, rewriting one bucket of a bucket(id, 3) table. */
+  @Test
+  void k2bPartialRewriteRacesCommit() throws Exception {
+    recreateBucketed();
+    onCommitAttempts(ImmutableSet.of(3, 7), () -> compact(0));
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k2b-partial-rewrite-races-commit"), "OK");
+  }
+
+  /** k2c: as k2a, rewriting every live DV into new DV files. */
+  @Test
+  void k2cDvRewriteRacesCommit() throws Exception {
+    onCommitAttempts(ImmutableSet.of(4, 8), () -> rewriteDvs() > 0);
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k2c-dv-rewrite-races-commit"), "OK");
+  }
+
+  /**
+   * k2d: two rewrites race one commit: the first splits every file's rows across two files, the
+   * second rewrites those again, so a DV must follow its rows into more than one rewritten file.
+   */
+  @Test
+  void k2dSplitThenRewriteRacesCommit() throws Exception {
+    onCommitAttempts(ImmutableSet.of(4), () -> compact(null, 2) && compact(null));
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k2d-split-then-rewrite-races-commit"), "OK");
+  }
+
+  /** k3a: a full rewrite races the first commit attempt of every checkpoint, up to 12 times. */
+  @Test
+  void k3aRewriteRacesEveryCommit() throws Exception {
+    AtomicLong lastCheckpoint = new AtomicLong(-1);
+    IcebergCommitter.setBeforeCommitAttempt(
+        checkpointId -> {
+          if (lastCheckpoint.getAndSet(checkpointId) != checkpointId && REWRITES.get() < 12) {
+            runRewrite(() -> compact(null));
+          }
+        });
+    runToEnd(0, null, null, 0);
+    expect(concurrentReport("k3a-rewrite-races-every-commit"), "OK");
+  }
+
+  /**
+   * k3b: a full rewrite races six attempts in a row, more than the sink retries one commit, and the
+   * job may restart twice.
+   */
+  @Test
+  void k3bRewriteStarvesOneCommit() throws Exception {
+    onCommitAttempts(ImmutableSet.of(3, 4, 5, 6, 7, 8), () -> compact(null));
+    runToEnd(0, null, null, 2);
+    expect(concurrentReport("k3b-rewrite-starves-one-commit"), "OK");
+  }
+
+  /** k4: external full rewrites every 500 ms on another thread while the job runs. */
+  @Test
+  void k4BackgroundRewritesWhileRunning() throws Exception {
+    try (BackgroundRewrites rewrites =
+        new BackgroundRewrites(() -> compact(null), REWRITE_PAUSE_MS)) {
+      runToEnd(0, null, null, 0);
+    }
+
+    expect(concurrentReport("k4-background-full-rewrites"), "OK");
+  }
+
+  /**
+   * k4x: external full rewrites back to back, faster than one sink commit; the job may restart
+   * three times. Reported, not asserted: the sink can lose every attempt of a commit.
+   */
+  @Test
+  void k4xBackToBackRewritesWhileRunning() throws Exception {
+    try (BackgroundRewrites rewrites = new BackgroundRewrites(() -> compact(null), 0)) {
+      runToEnd(0, null, null, 3);
+    }
+
+    concurrentReport("k4x-back-to-back-full-rewrites");
+  }
+
+  /**
+   * k5: the sink's in-job rewrite runs on every commit while external rewrites run every 500 ms.
+   */
+  @Test
+  void k5InJobAndExternalRewrites() throws Exception {
+    this.inJobRewrite = true;
+    try (BackgroundRewrites rewrites =
+        new BackgroundRewrites(() -> compact(null), REWRITE_PAUSE_MS)) {
+      runToEnd(0, null, null, 0);
+    }
+
+    table.refresh();
+    System.out.printf(
+        "NOTE k5 replace snapshots=%d%n",
+        Lists.newArrayList(table.snapshots()).stream()
+            .filter(snapshot -> "replace".equals(snapshot.operation()))
+            .count());
+    expect(concurrentReport("k5-in-job-and-external-rewrites"), "OK");
+  }
+
+  private String concurrentReport(String scenario) throws IOException {
+    System.out.printf(
+        "NOTE %s rewritesCommitted=%d rewriteFailures=%d %s sinkRetries=%d%n",
+        scenario,
+        REWRITES.get(),
+        REWRITE_FAILURES.size(),
+        Lists.newArrayList(REWRITE_FAILURES).stream().distinct().limit(3).toList(),
+        IndexDvCommits.RETRIES.get());
+    return report(scenario, RECORDS);
+  }
+
+  /** Runs the rewrite at the given (1-based) commit request, as each commit of the sink starts. */
+  private void onCommitRequests(Set<Integer> requests, Rewrite rewrite) {
+    AtomicInteger calls = new AtomicInteger();
+    IcebergCommitter.setBeforeCommitRequests(
+        checkpointId -> {
+          if (requests.contains(calls.incrementAndGet())) {
+            runRewrite(rewrite);
+          }
+        });
+  }
+
+  /** Runs the rewrite at the given (1-based) table commit attempts, retries included. */
+  private void onCommitAttempts(Set<Integer> attempts, Rewrite rewrite) {
+    AtomicInteger calls = new AtomicInteger();
+    IcebergCommitter.setBeforeCommitAttempt(
+        checkpointId -> {
+          if (attempts.contains(calls.incrementAndGet())) {
+            runRewrite(rewrite);
+          }
+        });
+  }
+
+  private static void runRewrite(Rewrite rewrite) {
+    try {
+      if (rewrite.run()) {
+        REWRITES.incrementAndGet();
+      }
+    } catch (Exception e) {
+      REWRITE_FAILURES.add(e.getClass().getSimpleName());
+    }
+  }
+
+  @FunctionalInterface
+  private interface Rewrite {
+    /** Returns whether a rewrite was committed. */
+    boolean run() throws Exception;
+  }
+
+  /** Runs a rewrite in a loop on its own thread until closed. */
+  private static final class BackgroundRewrites implements AutoCloseable {
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final Thread thread;
+
+    BackgroundRewrites(Rewrite rewrite, long pauseMillis) {
+      this.thread =
+          new Thread(
+              () -> {
+                while (running.get()) {
+                  runRewrite(rewrite);
+                  try {
+                    Thread.sleep(pauseMillis);
+                  } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                  }
+                }
+              },
+              "background-rewrites");
+      thread.start();
+    }
+
+    @Override
+    public void close() throws InterruptedException {
+      running.set(false);
+      thread.join();
+    }
+  }
+
   private String staleVerdict() {
     return "rebuild".equals(staleRestore) ? "OK" : "LOUD";
   }
@@ -477,9 +701,18 @@ class TestIcebergSinkFailureScenarios {
   }
 
   /** Rewrites the live rows of every data file, or of one bucket only, like RewriteDataFiles. */
-  private void compact(Integer bucket) throws IOException {
+  private boolean compact(Integer bucket) throws IOException {
+    return compact(bucket, 1);
+  }
+
+  /** As compact, splitting each partition's live rows by key across the given number of files. */
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
+  private boolean compact(Integer bucket, int filesPerPartition) throws IOException {
     table.refresh();
     Snapshot head = table.currentSnapshot();
+    if (head == null) {
+      return false;
+    }
     PartitionKey partitionKey = new PartitionKey(table.spec(), table.schema());
     Map<StructLike, List<Record>> liveByPartition =
         StructLikeMap.create(table.spec().partitionType());
@@ -509,17 +742,31 @@ class TestIcebergSinkFailureScenarios {
 
     GenericAppenderHelper appender =
         new GenericAppenderHelper(table, FileFormat.PARQUET, compactionDir);
+    int added = 0;
     for (Map.Entry<StructLike, List<Record>> entry : liveByPartition.entrySet()) {
-      rewrite.addFile(
-          table.spec().isUnpartitioned()
-              ? appender.writeFile(entry.getValue())
-              : appender.writeFile(entry.getKey(), entry.getValue()));
+      for (int split = 0; split < filesPerPartition; split++) {
+        List<Record> rows = Lists.newArrayList();
+        for (Record record : entry.getValue()) {
+          if ((Integer) record.getField("id") % filesPerPartition == split) {
+            rows.add(record);
+          }
+        }
+
+        if (!rows.isEmpty()) {
+          rewrite.addFile(
+              table.spec().isUnpartitioned()
+                  ? appender.writeFile(rows)
+                  : appender.writeFile(entry.getKey(), rows));
+          added++;
+        }
+      }
     }
 
     rewrite.commit();
     System.out.printf(
         "NOTE compaction bucket=%s removedDataFiles=%d addedDataFiles=%d%n",
-        bucket, removed, liveByPartition.size());
+        bucket, removed, added);
+    return true;
   }
 
   /** Rewrites every live DV into a new DV file, like rewrite-position-deletes. */
@@ -670,6 +917,15 @@ class TestIcebergSinkFailureScenarios {
       builder
           .set(FlinkWriteOptions.UPSERT_MODE.key(), "index-dv")
           .set(FlinkWriteOptions.UPSERT_STALE_RESTORE.key(), staleRestore);
+    }
+
+    if (inJobRewrite) {
+      builder
+          .set(FlinkWriteOptions.COMPACTION_ENABLE.key(), "true")
+          .set(RewriteDataFilesConfig.SCHEDULE_ON_COMMIT_COUNT, "1")
+          .set(RewriteDataFilesConfig.PREFIX + SizeBasedFileRewritePlanner.REWRITE_ALL, "true")
+          .set(FlinkMaintenanceConfig.RATE_LIMIT, "1")
+          .set(FlinkMaintenanceConfig.LOCK_CHECK_DELAY, "1");
     }
 
     builder.append();
