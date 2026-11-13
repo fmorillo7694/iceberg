@@ -51,6 +51,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.flink.CatalogLoader;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.FlinkWriteOptions;
+import org.apache.iceberg.flink.maintenance.operator.SerializedEqualityValues;
 import org.apache.iceberg.flink.sink.IcebergSink;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -126,7 +127,8 @@ public class DynamicIcebergSink
         flinkWriteConf.overwriteMode(),
         flinkWriteConf.workerPoolSize(),
         sinkId,
-        metrics);
+        metrics,
+        flinkWriteConf.upsertIndexDvMode());
   }
 
   @Override
@@ -441,7 +443,8 @@ public class DynamicIcebergSink
 
     private DynamicIcebergSink build(
         SingleOutputStreamOperator<DynamicRecordInternal> converted,
-        DynamicRecordInternalType sideOutputType) {
+        DynamicRecordInternalType sideOutputType,
+        DataStream<CommittableMessage<DynamicWriteResult>> indexDvResults) {
 
       Preconditions.checkArgument(
           generator != null, "Please use withGenerator() to convert the input DataStream.");
@@ -475,7 +478,55 @@ public class DynamicIcebergSink
       }
 
       // Inject forward write results into sink — they'll be unioned in addPreCommitTopology
-      return instantiateSink(writeOptions, flinkConfig, forwardWriteResults);
+      return instantiateSink(
+          writeOptions,
+          flinkConfig,
+          indexDvResults != null ? forwardWriteResults.union(indexDvResults) : forwardWriteResults);
+    }
+
+    /**
+     * POC: in the index-dv mode, upsert records are keyed by (table, branch, equality key) and
+     * written before the SinkV2 writer; a relay writer hands their results to the aggregator.
+     */
+    private DataStream<CommittableMessage<DynamicWriteResult>> indexDvTopology(
+        DataStream<DynamicRecordInternal> records, Configuration flinkConfig) {
+      // Unaligned barriers overtake in-flight results, so a DV could commit before its data file.
+      Preconditions.checkState(
+          !records.getExecutionEnvironment().getCheckpointConfig().isUnalignedCheckpointsEnabled(),
+          "Upsert mode 'index-dv' requires aligned checkpoints");
+      Integer writeParallelism =
+          new FlinkWriteConf(writeOptions, readableConfig).writeParallelism();
+      int parallelism =
+          writeParallelism != null
+              ? writeParallelism
+              : records.getExecutionEnvironment().getParallelism();
+      SingleOutputStreamOperator<byte[]> data =
+          records
+              .keyBy(
+                  new DynamicIndexDvKeySelector(),
+                  TypeInformation.of(SerializedEqualityValues.class))
+              .transform(
+                  operatorName("index-dv-writer"),
+                  DynamicIndexDvDataWriter.RESULT_TYPE,
+                  new DynamicIndexDvDataWriter(catalogLoader, writeOptions, flinkConfig))
+              .uid(prefixIfNotNull(uidPrefix, "-index-dv-writer"))
+              .setParallelism(parallelism);
+      SingleOutputStreamOperator<byte[]> dvs =
+          data.getSideOutput(DynamicIndexDvDataWriter.DELETES)
+              .keyBy(DynamicDvPosition::dataFilePath)
+              .transform(
+                  operatorName("index-dv-delete-writer"),
+                  DynamicIndexDvDataWriter.RESULT_TYPE,
+                  new DynamicIndexDvDeleteWriter(catalogLoader))
+              .uid(prefixIfNotNull(uidPrefix, "-index-dv-delete-writer"))
+              .setParallelism(parallelism);
+      return data.union(dvs)
+          .transform(
+              operatorName("index-dv-relay"),
+              CommittableMessageTypeInfo.of(DynamicWriteResultSerializer::new),
+              new SinkWriterOperatorFactory<>(new DynamicIndexDvRelaySink()))
+          .uid(prefixIfNotNull(uidPrefix, "-index-dv-relay"))
+          .setParallelism(parallelism);
     }
 
     @VisibleForTesting
@@ -551,10 +602,8 @@ public class DynamicIcebergSink
         converted.slotSharingGroup(generatorSsg);
       }
 
-      DynamicIcebergSink sink = build(converted, sideOutputType);
-
       // Shuffle path: table update side output + main output → sinkTo()
-      DataStream<DynamicRecordInternal> shuffleInput =
+      SingleOutputStreamOperator<DynamicRecordInternal> updated =
           converted
               .getSideOutput(
                   new OutputTag<>(
@@ -564,8 +613,19 @@ public class DynamicIcebergSink
                   new DynamicTableUpdateOperator(catalogLoader, tableCreator, flinkDynamicSinkConf))
               .uid(prefixIfNotNull(uidPrefix, "-updater"))
               .name(operatorName("Updater"))
-              .returns(type)
-              .union(converted);
+              .returns(type);
+      DataStream<DynamicRecordInternal> shuffleInput = updated.union(converted);
+
+      DataStream<CommittableMessage<DynamicWriteResult>> indexDvResults = null;
+      if (new FlinkWriteConf(writeOptions, readableConfig).upsertIndexDvMode()) {
+        // Filter each input at its own parallelism so the filter chains to it: a rebalance in
+        // front of the key-by would reorder the records of a key.
+        indexDvResults =
+            indexDvTopology(upserts(updated, true).union(upserts(converted, true)), flinkConfig);
+        shuffleInput = upserts(updated, false).union(upserts(converted, false));
+      }
+
+      DynamicIcebergSink sink = build(converted, sideOutputType, indexDvResults);
 
       DataStreamSink<DynamicRecordInternal> result =
           shuffleInput
@@ -582,6 +642,13 @@ public class DynamicIcebergSink
       }
 
       return result;
+    }
+
+    private static SingleOutputStreamOperator<DynamicRecordInternal> upserts(
+        SingleOutputStreamOperator<DynamicRecordInternal> records, boolean upsert) {
+      return records
+          .filter(record -> record.upsertMode() == upsert)
+          .setParallelism(records.getParallelism());
     }
 
     private Configuration fromReadableConfig() {

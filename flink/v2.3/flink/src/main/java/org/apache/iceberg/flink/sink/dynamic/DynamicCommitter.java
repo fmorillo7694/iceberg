@@ -50,6 +50,7 @@ import org.apache.iceberg.flink.sink.CommitSummary;
 import org.apache.iceberg.flink.sink.DeltaManifests;
 import org.apache.iceberg.flink.sink.DeltaManifestsSerializer;
 import org.apache.iceberg.flink.sink.FlinkManifestUtil;
+import org.apache.iceberg.flink.sink.IndexDvCommits;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -89,6 +90,7 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
   private final DynamicCommitterMetrics committerMetrics;
   private final Catalog catalog;
   private final ExecutorService workerPool;
+  private final boolean indexDvMode;
 
   DynamicCommitter(
       Catalog catalog,
@@ -97,6 +99,25 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
       int workerPoolSize,
       String sinkId,
       DynamicCommitterMetrics committerMetrics) {
+    this(
+        catalog,
+        snapshotProperties,
+        replacePartitions,
+        workerPoolSize,
+        sinkId,
+        committerMetrics,
+        false);
+  }
+
+  DynamicCommitter(
+      Catalog catalog,
+      Map<String, String> snapshotProperties,
+      boolean replacePartitions,
+      int workerPoolSize,
+      String sinkId,
+      DynamicCommitterMetrics committerMetrics,
+      boolean indexDvMode) {
+    this.indexDvMode = indexDvMode;
     this.snapshotProperties = snapshotProperties;
     this.replacePartitions = replacePartitions;
     this.committerMetrics = committerMetrics;
@@ -324,6 +345,32 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
     for (Map.Entry<Long, List<WriteResult>> e : pendingResults.entrySet()) {
       long checkpointId = e.getKey();
       List<WriteResult> writeResults = e.getValue();
+
+      if (indexDvMode) {
+        CommitSummary summary = new CommitSummary();
+        summary.addAll(writeResults);
+        // POC: the key columns for rebasing DVs over rewrites are the table's identifier fields,
+        // which the index-dv writer requires to be the equality fields.
+        IndexDvCommits.commit(
+            table,
+            branch,
+            WriteResult.builder().addAll(writeResults).build(),
+            operatorId,
+            null,
+            table.schema().identifierFieldIds(),
+            rowDelta ->
+                commitOperation(
+                    table,
+                    branch,
+                    rowDelta,
+                    summary,
+                    "rowDelta",
+                    newFlinkJobId,
+                    sinkId,
+                    operatorId,
+                    checkpointId));
+        continue;
+      }
 
       RowDelta rowDelta = table.newRowDelta().scanManifestsWith(workerPool);
       for (WriteResult result : writeResults) {

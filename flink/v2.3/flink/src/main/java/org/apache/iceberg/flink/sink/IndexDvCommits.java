@@ -27,6 +27,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import org.apache.flink.annotation.Internal;
 import org.apache.iceberg.Accessor;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataOperations;
@@ -82,7 +83,9 @@ import org.slf4j.LoggerFactory;
  * with the live DV of its data file. A commit that still fails validation is rebuilt against the
  * new head a bounded number of times.
  */
-class IndexDvCommits {
+// POC: public so that the dynamic sink's committer can use it.
+@Internal
+public class IndexDvCommits {
   private static final Logger LOG = LoggerFactory.getLogger(IndexDvCommits.class);
   private static final int MAX_ATTEMPTS = 4;
 
@@ -92,7 +95,7 @@ class IndexDvCommits {
   private IndexDvCommits() {}
 
   /** Commits the files of one checkpoint, rebuilding the row delta on validation failures. */
-  static void commit(
+  public static void commit(
       Table table,
       String branch,
       WriteResult result,
