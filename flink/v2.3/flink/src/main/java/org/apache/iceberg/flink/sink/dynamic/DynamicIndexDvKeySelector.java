@@ -18,76 +18,17 @@
  */
 package org.apache.iceberg.flink.sink.dynamic;
 
-import java.util.Map;
-import java.util.Set;
 import org.apache.flink.api.java.functions.KeySelector;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.flink.FlinkSchemaUtil;
-import org.apache.iceberg.flink.RowDataWrapper;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.iceberg.flink.maintenance.operator.SerializedEqualityValues;
-import org.apache.iceberg.flink.maintenance.operator.StructLikeSerializer;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.apache.iceberg.util.StructProjection;
 
-/** POC: keys upsert records of the dynamic sink by (table, branch, equality key). */
+/** POC: keys upsert records by the key {@link DynamicIndexDvKeyAssigner} attached to them. */
 class DynamicIndexDvKeySelector
-    implements KeySelector<DynamicRecordInternal, SerializedEqualityValues> {
-  // shortcut: unbounded per (table, schema, branch); upgrade to an LRU for many tables
-  private transient Map<String, TableEntry> tables;
-  private transient StructLikeSerializer serializer;
-
+    implements KeySelector<
+        Tuple2<SerializedEqualityValues, DynamicRecordInternal>, SerializedEqualityValues> {
   @Override
-  public SerializedEqualityValues getKey(DynamicRecordInternal record) {
-    if (tables == null) {
-      this.tables = Maps.newHashMap();
-      this.serializer = new StructLikeSerializer();
-    }
-
-    TableEntry table = tables.computeIfAbsent(record.tableName(), TableEntry::new);
-    Extractor extractor = table.extractor(record.schema(), record.equalityFields());
-    SerializedEqualityValues key =
-        serializer.serializeKey(
-            extractor.projection.wrap(extractor.wrapper.wrap(record.rowData())),
-            extractor.keySchema.asStruct());
-    return DynamicIndexDvKeys.compose(table.prefix(record.branch()), key);
-  }
-
-  private static final class TableEntry {
-    private final String tableName;
-    private final Map<Integer, Extractor> extractors = Maps.newHashMap();
-    private final Map<String, byte[]> prefixes = Maps.newHashMap();
-
-    private TableEntry(String tableName) {
-      this.tableName = tableName;
-    }
-
-    private Extractor extractor(Schema schema, Set<Integer> equalityFields) {
-      Extractor extractor = extractors.get(schema.schemaId());
-      if (extractor == null || !extractor.equalityFields.equals(equalityFields)) {
-        extractor = new Extractor(schema, equalityFields);
-        extractors.put(schema.schemaId(), extractor);
-      }
-
-      return extractor;
-    }
-
-    private byte[] prefix(String branch) {
-      return prefixes.computeIfAbsent(branch, name -> DynamicIndexDvKeys.prefix(tableName, name));
-    }
-  }
-
-  private static final class Extractor {
-    private final Set<Integer> equalityFields;
-    private final RowDataWrapper wrapper;
-    private final StructProjection projection;
-    private final Schema keySchema;
-
-    private Extractor(Schema schema, Set<Integer> equalityFields) {
-      this.equalityFields = ImmutableSet.copyOf(equalityFields);
-      this.keySchema = DynamicIndexDvKeys.keySchema(schema, equalityFields);
-      this.wrapper = new RowDataWrapper(FlinkSchemaUtil.convert(schema), schema.asStruct());
-      this.projection = StructProjection.create(schema, keySchema);
-    }
+  public SerializedEqualityValues getKey(
+      Tuple2<SerializedEqualityValues, DynamicRecordInternal> keyed) {
+    return keyed.f0;
   }
 }

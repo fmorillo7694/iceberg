@@ -22,7 +22,10 @@ import static org.apache.iceberg.flink.TestFixtures.DATABASE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -230,7 +233,8 @@ class DynamicIndexDvBenchmark {
     String keysEnv = System.getenv("KEY_BENCH_KEYS");
     assumeThat(keysEnv).isNotNull();
     int keys = Integer.parseInt(keysEnv);
-    for (String encoding : ImmutableList.of("int", "int-no-table", "long", "uuid", "uuid-hash64")) {
+    for (String encoding :
+        ImmutableList.of("int", "int-table-id", "int-no-table", "long", "uuid", "uuid-hash64")) {
       KeySource.EMITTED_ALL.set(false);
       StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
       env.setParallelism(PARALLELISM);
@@ -398,7 +402,23 @@ class DynamicIndexDvBenchmark {
   /** Emits each key once in the given encoding, then idles until cancelled. */
   private static class KeySource implements SourceFunction<SerializedEqualityValues> {
     private static final AtomicBoolean EMITTED_ALL = new AtomicBoolean();
-    private static final TableKey TABLE = new TableKey("default.events", "main");
+    private static final byte[] TABLE_ID =
+        DynamicIndexDvKeys.prefix(DynamicIndexDvKeys.tableId(UUID.randomUUID(), "main"));
+
+    /** Key format 1: the table name and branch in front of the equality key. */
+    private static SerializedEqualityValues namePrefixed(SerializedEqualityValues key) {
+      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      try (DataOutputStream out = new DataOutputStream(bytes)) {
+        out.writeUTF("default.events");
+        out.writeUTF("main");
+        out.write(key.data());
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+
+      return new SerializedEqualityValues(bytes.toByteArray());
+    }
+
     private static final StructType INT_KEY =
         StructType.of(NestedField.required(1, "id", IntegerType.get()));
     private static final StructType LONG_KEY =
@@ -418,23 +438,18 @@ class DynamicIndexDvBenchmark {
     static SerializedEqualityValues encode(String encoding, int id) {
       StructLikeSerializer serializer = new StructLikeSerializer();
       return switch (encoding) {
-        case "int" ->
-            DynamicIndexDvKeys.compose(TABLE, serializer.serializeKey(new Single(id), INT_KEY));
+        case "int" -> namePrefixed(serializer.serializeKey(new Single(id), INT_KEY));
         case "int-no-table" -> serializer.serializeKey(new Single(id), INT_KEY);
-        case "long" ->
-            DynamicIndexDvKeys.compose(
-                TABLE, serializer.serializeKey(new Single((long) id << 20), LONG_KEY));
-        case "uuid" ->
-            DynamicIndexDvKeys.compose(
-                TABLE, serializer.serializeKey(new Single(uuid(id)), STRING_KEY));
+        case "int-table-id" ->
+            DynamicIndexDvKeys.compose(TABLE_ID, serializer.serializeKey(new Single(id), INT_KEY));
+        case "long" -> namePrefixed(serializer.serializeKey(new Single((long) id << 20), LONG_KEY));
+        case "uuid" -> namePrefixed(serializer.serializeKey(new Single(uuid(id)), STRING_KEY));
         case "uuid-hash64" ->
             new SerializedEqualityValues(
                 Arrays.copyOf(
                     Hashing.murmur3_128()
                         .hashBytes(
-                            DynamicIndexDvKeys.compose(
-                                    TABLE,
-                                    serializer.serializeKey(new Single(uuid(id)), STRING_KEY))
+                            namePrefixed(serializer.serializeKey(new Single(uuid(id)), STRING_KEY))
                                 .data())
                         .asBytes(),
                     8));

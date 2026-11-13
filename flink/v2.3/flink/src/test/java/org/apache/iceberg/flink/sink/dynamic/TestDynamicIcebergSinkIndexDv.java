@@ -27,6 +27,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -49,10 +50,12 @@ import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.types.Row;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Collector;
+import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
@@ -61,25 +64,33 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.GenericAppenderHelper;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.flink.CatalogLoader;
+import org.apache.iceberg.flink.FlinkCatalogFactory;
 import org.apache.iceberg.flink.FlinkWriteOptions;
 import org.apache.iceberg.flink.HadoopCatalogExtension;
 import org.apache.iceberg.flink.MiniFlinkClusterExtension;
 import org.apache.iceberg.flink.TestFixtures;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.jdbc.JdbcCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types.IntegerType;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.util.ContentFileUtil;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -125,11 +136,21 @@ class TestDynamicIcebergSinkIndexDv {
 
   @TempDir private Path savepointDir;
   @TempDir private Path appendDir;
+  @TempDir private Path jdbcDir;
 
   @BeforeEach
   void before() {
     DynamicIndexDvDataWriter.TABLE_BOOTSTRAPS.set(0);
     DynamicIndexDvDataWriter.BOOTSTRAPPED_KEYS.set(0);
+    DynamicIndexDvDataWriter.LEGACY_REBUILDS.set(0);
+    BatchesSource.PAUSED.set(false);
+    BatchesSource.RESUME.set(false);
+  }
+
+  @AfterEach
+  void after() {
+    DynamicIndexDvKeys.setTestTableIds(null);
+    DynamicIndexDvDataWriter.setWriteLegacyTableState(false);
   }
 
   @Test
@@ -321,7 +342,209 @@ class TestDynamicIcebergSinkIndexDv {
     }
   }
 
+  @Test
+  void sameTableNameInTwoNamespacesKeepsSeparateIndexes() throws Exception {
+    ((SupportsNamespaces) CATALOG_EXTENSION.catalog()).createNamespace(Namespace.of("other"));
+    List<String> tables = ImmutableList.of("t_a", "other.t_a");
+    List<List<Row>> batches = changelog(tables, 4, 60, 15, 30, 1);
+    run(batches, INDEX_DV, "");
+
+    Map<String, Map<Integer, String>> model = model(batches);
+    for (String table : tables) {
+      assertThat(liveRows(table)).as(table).containsExactlyInAnyOrderElementsOf(rows(model, table));
+      assertThat(filesWithSeveralDvs(table)).as(table).isEmpty();
+    }
+  }
+
+  @Test
+  void tableRecreatedMidRunStartsAFreshIndex() throws Exception {
+    List<List<Row>> before = changelog(ImmutableList.of("t_a"), 2, 40, 15, 31, 1);
+    List<List<Row>> after = changelog(ImmutableList.of("t_a"), 2, 40, 15, 32, 1);
+    JobClient job = startPausing(before, after, CATALOG_EXTENSION.catalogLoader());
+    awaitCommitsSettled(CATALOG_EXTENSION.catalog(), identifier("t_a"));
+    Set<String> oldDataFiles = dataFiles(table("t_a"));
+    CATALOG_EXTENSION.catalog().dropTable(identifier("t_a"), true);
+    V3_TABLES.createTable(
+        CATALOG_EXTENSION.catalog(), identifier("t_a"), SCHEMA_V1, PartitionSpec.unpartitioned());
+    resume(job);
+
+    assertThat(liveRows("t_a")).containsExactlyInAnyOrderElementsOf(rows(model(after), "t_a"));
+    assertThat(dvTargets(table("t_a"))).isNotEmpty().doesNotContainAnyElementsOf(oldDataFiles);
+    assertThat(dataFiles(table("t_a"))).containsAll(dvTargets(table("t_a")));
+  }
+
+  @Test
+  void renamedTableKeepsItsIndex() throws Exception {
+    CatalogLoader jdbc =
+        CatalogLoader.custom(
+            "jdbc",
+            ImmutableMap.of(
+                CatalogProperties.URI,
+                "jdbc:sqlite:" + jdbcDir.resolve("catalog.db"),
+                CatalogProperties.WAREHOUSE_LOCATION,
+                jdbcDir.resolve("warehouse").toString()),
+            FlinkCatalogFactory.clusterHadoopConf(),
+            JdbcCatalog.class.getName());
+    Catalog catalog = jdbc.loadCatalog();
+    ((SupportsNamespaces) catalog).createNamespace(Namespace.of(DATABASE));
+    List<List<Row>> before = changelog(ImmutableList.of("r_a"), 2, 40, 15, 33, 1);
+    List<List<Row>> after = changelog(ImmutableList.of("r_b"), 2, 40, 15, 34, 1);
+    JobClient job = startPausing(before, after, jdbc);
+    awaitCommitsSettled(catalog, identifier("r_a"));
+    catalog.renameTable(identifier("r_a"), identifier("r_b"));
+    resume(job);
+
+    Map<String, Map<Integer, String>> model = model(before);
+    model.put("r_b", model.remove("r_a"));
+    apply(model, after);
+    assertThat(liveRows(catalog.loadTable(identifier("r_b"))))
+        .containsExactlyInAnyOrderElementsOf(rows(model, "r_b"));
+    assertThat(DynamicIndexDvDataWriter.BOOTSTRAPPED_KEYS.get()).isZero();
+  }
+
+  @Test
+  void keyFormatOneRestoreFailsLoudly() throws Exception {
+    String savepoint = savepointInKeyFormatOne(changelog(TABLES, 2, 60, 15, 35, 1));
+
+    List<List<Row>> second = changelog(TABLES, 1, 30, 15, 36, 1);
+    StreamExecutionEnvironment env = restoredEnvironment(savepoint, PARALLELISM);
+    sink(env.addSource(new BatchesSource(second, false), INPUT_TYPE).uid("source"), INDEX_DV);
+    assertThatThrownBy(() -> env.execute("dynamic index-dv restore of key format 1"))
+        .rootCause()
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("uses key format 1")
+        .hasMessageContaining("upsert-stale-restore=rebuild");
+  }
+
+  @Test
+  void keyFormatOneRestoreRebuildsFromTheHead() throws Exception {
+    List<List<Row>> first = changelog(TABLES, 2, 60, 15, 37, 1);
+    String savepoint = savepointInKeyFormatOne(first);
+
+    List<List<Row>> second = changelog(TABLES, 2, 60, 15, 38, 1);
+    StreamExecutionEnvironment env = restoredEnvironment(savepoint, PARALLELISM);
+    sink(
+        env.addSource(new BatchesSource(second, false), INPUT_TYPE).uid("source"),
+        INDEX_DV,
+        "",
+        PARALLELISM,
+        CATALOG_EXTENSION.catalogLoader(),
+        ImmutableMap.of(FlinkWriteOptions.UPSERT_STALE_RESTORE.key(), "rebuild"));
+    env.execute("dynamic index-dv rebuild of key format 1");
+
+    Map<String, Map<Integer, String>> model = model(first);
+    apply(model, second);
+    for (String table : TABLES) {
+      assertThat(liveRows(table)).as(table).containsExactlyInAnyOrderElementsOf(rows(model, table));
+      assertThat(filesWithSeveralDvs(table)).as(table).isEmpty();
+    }
+
+    assertThat(DynamicIndexDvDataWriter.LEGACY_REBUILDS.get()).isPositive();
+    assertThat(DynamicIndexDvDataWriter.BOOTSTRAPPED_KEYS.get()).isPositive();
+  }
+
+  @Test
+  void tableIdCollisionFailsLoudly() {
+    DynamicIndexDvKeys.setTestTableIds((uuid, branch) -> 42L);
+    List<List<Row>> batches = changelog(ImmutableList.of("t_a", "t_b"), 1, 40, 15, 39, 1);
+    assertThatThrownBy(() -> run(batches, INDEX_DV, ""))
+        .rootCause()
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Table id collision")
+        .hasMessageContaining("t_a")
+        .hasMessageContaining("t_b");
+  }
+
   // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Writes a savepoint whose per-table metadata is in key format 1 and whose keys carry ids that
+   * format 2 never derives, as the keys of a format 1 state never match format 2 keys.
+   */
+  private String savepointInKeyFormatOne(List<List<Row>> batches) throws Exception {
+    DynamicIndexDvDataWriter.setWriteLegacyTableState(true);
+    DynamicIndexDvKeys.setTestTableIds((uuid, branch) -> uuid.getLeastSignificantBits());
+    try {
+      return runUntilSavepoint(batches, PARALLELISM);
+    } finally {
+      DynamicIndexDvDataWriter.setWriteLegacyTableState(false);
+      DynamicIndexDvKeys.setTestTableIds(null);
+    }
+  }
+
+  /**
+   * Starts a job that writes the first batches, waits until they are committed and returns while
+   * the source pauses, so the caller can change the catalog before {@link #resume}.
+   */
+  private JobClient startPausing(
+      List<List<Row>> first, List<List<Row>> second, CatalogLoader loader) throws Exception {
+    List<List<Row>> batches = Lists.newArrayList(first);
+    batches.addAll(second);
+    StreamExecutionEnvironment env = environment(new Configuration(), PARALLELISM, false);
+    sink(
+        env.addSource(new BatchesSource(batches, false, first.size()), INPUT_TYPE).uid("source"),
+        INDEX_DV,
+        "",
+        PARALLELISM,
+        loader,
+        ImmutableMap.of(FlinkDynamicSinkOptions.CACHE_REFRESH_MS.key(), "50"));
+    JobClient job = env.executeAsync("dynamic index-dv with a catalog change");
+    while (!BatchesSource.PAUSED.get()) {
+      if (job.getJobStatus().get().isTerminalState()) {
+        job.getJobExecutionResult().get();
+        throw new IllegalStateException("Job ended before pausing");
+      }
+
+      Thread.sleep(20);
+    }
+
+    return job;
+  }
+
+  /** Waits until the commits of the batches before the pause have landed. */
+  private static void awaitCommitsSettled(Catalog catalog, TableIdentifier identifier)
+      throws InterruptedException {
+    Long last = null;
+    for (int stable = 0; stable < 5; ) {
+      Thread.sleep(200);
+      Table table = catalog.loadTable(identifier);
+      Long current = table.currentSnapshot() != null ? table.currentSnapshot().snapshotId() : null;
+      stable = current != null && current.equals(last) ? stable + 1 : 0;
+      last = current;
+    }
+  }
+
+  /** Lets every cached table UUID expire, then resumes the source and waits for the job. */
+  private static void resume(JobClient job) throws Exception {
+    Thread.sleep(500);
+    BatchesSource.RESUME.set(true);
+    job.getJobExecutionResult().get(120, TimeUnit.SECONDS);
+  }
+
+  private static Set<String> dataFiles(Table table) throws IOException {
+    Set<String> paths = Sets.newHashSet();
+    try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+      for (FileScanTask task : tasks) {
+        paths.add(task.file().location());
+      }
+    }
+
+    return paths;
+  }
+
+  private static Set<String> dvTargets(Table table) throws IOException {
+    Set<String> targets = Sets.newHashSet();
+    for (ManifestFile manifest : table.currentSnapshot().deleteManifests(table.io())) {
+      try (ManifestReader<DeleteFile> reader =
+          ManifestFiles.readDeleteManifest(manifest, table.io(), table.specs())) {
+        for (DeleteFile file : reader) {
+          targets.add(file.referencedDataFile());
+        }
+      }
+    }
+
+    return targets;
+  }
 
   private void run(List<List<Row>> batches, String mode, String suffix) throws Exception {
     run(batches, mode, suffix, PARALLELISM);
@@ -385,15 +608,36 @@ class TestDynamicIcebergSinkIndexDv {
   }
 
   static void sink(DataStream<Row> input, String mode, String suffix, int parallelism) {
-    DynamicIcebergSink.forInput(input)
-        .generator(new Generator(suffix))
-        .catalogLoader(CATALOG_EXTENSION.catalogLoader())
-        .tableCreator(V3_TABLES)
-        .immediateTableUpdate(true)
-        .writeParallelism(parallelism)
-        .uidPrefix("dyn")
-        .set(FlinkWriteOptions.UPSERT_MODE.key(), mode)
-        .append();
+    sink(input, mode, suffix, parallelism, CATALOG_EXTENSION.catalogLoader(), ImmutableMap.of());
+  }
+
+  private static void sink(DataStream<Row> input, String mode) {
+    sink(input, mode, "", PARALLELISM);
+  }
+
+  static void sink(
+      DataStream<Row> input,
+      String mode,
+      String suffix,
+      int parallelism,
+      CatalogLoader catalogLoader,
+      Map<String, String> options) {
+    DynamicIcebergSink.Builder<Row> builder =
+        DynamicIcebergSink.forInput(input)
+            .generator(new Generator(suffix))
+            .catalogLoader(catalogLoader)
+            .tableCreator(V3_TABLES)
+            .immediateTableUpdate(true)
+            .writeParallelism(parallelism)
+            .uidPrefix("dyn")
+            .set(FlinkWriteOptions.UPSERT_MODE.key(), mode);
+    options.forEach(builder::set);
+    builder.append();
+  }
+
+  /** A name with a namespace is used as is; a plain name is in {@code DATABASE}. */
+  static TableIdentifier identifier(String name) {
+    return name.contains(".") ? TableIdentifier.parse(name) : TableIdentifier.of(DATABASE, name);
   }
 
   /** Random upserts and deletes over a few keys per table, interleaved across tables. */
@@ -446,12 +690,16 @@ class TestDynamicIcebergSinkIndexDv {
   }
 
   static Table table(String name) {
-    return CATALOG_EXTENSION.catalog().loadTable(TableIdentifier.of(DATABASE, name));
+    return CATALOG_EXTENSION.catalog().loadTable(identifier(name));
   }
 
   static List<String> liveRows(String name) throws IOException {
+    return liveRows(table(name));
+  }
+
+  static List<String> liveRows(Table table) throws IOException {
     List<String> rows = Lists.newArrayList();
-    try (CloseableIterable<Record> records = IcebergGenerics.read(table(name)).build()) {
+    try (CloseableIterable<Record> records = IcebergGenerics.read(table).build()) {
       for (Record record : records) {
         rows.add(record.getField("id") + ":" + record.getField("data"));
       }
@@ -524,7 +772,7 @@ class TestDynamicIcebergSinkIndexDv {
               : GenericRowData.ofKind(row.getKind(), id, data);
       DynamicRecord record =
           new DynamicRecord(
-              TableIdentifier.of(DATABASE, row.getField(0) + suffix),
+              identifier(row.getField(0) + suffix),
               SnapshotRef.MAIN_BRANCH,
               version == 2 ? SCHEMA_V2 : SCHEMA_V1,
               rowData,
@@ -559,24 +807,43 @@ class TestDynamicIcebergSinkIndexDv {
     }
   }
 
-  /** Emits each batch after two completed checkpoints, then ends or idles until stopped. */
+  /**
+   * Emits each batch after two completed checkpoints, then ends or idles until stopped. With a
+   * pause, it waits for {@link #RESUME} before the batch at that index.
+   */
   static class BatchesSource implements SourceFunction<Row>, CheckpointListener {
     static final AtomicBoolean EMITTED_ALL = new AtomicBoolean();
+    static final AtomicBoolean PAUSED = new AtomicBoolean();
+    static final AtomicBoolean RESUME = new AtomicBoolean();
 
     private final List<List<Row>> batches;
     private final boolean idleAtEnd;
+    private final int pauseBefore;
     private final AtomicInteger completedCheckpoints = new AtomicInteger();
     private volatile boolean running = true;
 
     BatchesSource(List<List<Row>> batches, boolean idleAtEnd) {
+      this(batches, idleAtEnd, -1);
+    }
+
+    BatchesSource(List<List<Row>> batches, boolean idleAtEnd, int pauseBefore) {
       this.batches = batches;
       this.idleAtEnd = idleAtEnd;
+      this.pauseBefore = pauseBefore;
     }
 
     @Override
     public void run(SourceContext<Row> ctx) throws Exception {
       awaitCheckpoints(1);
-      for (List<Row> batch : batches) {
+      for (int index = 0; index < batches.size(); index++) {
+        List<Row> batch = batches.get(index);
+        if (index == pauseBefore) {
+          PAUSED.set(true);
+          while (running && !RESUME.get()) {
+            Thread.sleep(10);
+          }
+        }
+
         synchronized (ctx.getCheckpointLock()) {
           batch.forEach(ctx::collect);
         }

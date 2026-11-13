@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -34,6 +35,7 @@ import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.io.SimpleVersionedSerialization;
 import org.apache.flink.runtime.state.KeyGroupRange;
@@ -94,13 +96,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * POC: the upsert writer of the dynamic sink's index-dv mode, keyed by (table, branch, equality
- * key). It writes the data files itself and keeps each key's live row position in keyed state. A
- * table is set up on its first record on a subtask: the subtask indexes the keys it owns from the
- * branch head, and after a restore first checks that the restored index is not behind the table.
+ * POC: the upsert writer of the dynamic sink's index-dv mode, keyed by (table id, equality key). It
+ * writes the data files itself and keeps each key's live row position in keyed state. A table is
+ * set up on its first record on a subtask: the subtask indexes the keys it owns from the branch
+ * head, and after a restore first checks that the restored index is not behind the table.
+ *
+ * <p>The index follows the table UUID: a renamed table keeps its index, and a table re-created
+ * under the same name starts a new one. Two tables whose ids collide fail the job.
  */
 class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
-    implements OneInputStreamOperator<DynamicRecordInternal, byte[]>, BoundedOneInput {
+    implements OneInputStreamOperator<
+            Tuple2<SerializedEqualityValues, DynamicRecordInternal>, byte[]>,
+        BoundedOneInput {
   private static final Logger LOG = LoggerFactory.getLogger(DynamicIndexDvDataWriter.class);
 
   static final OutputTag<DynamicDvPosition> DELETES =
@@ -114,31 +121,45 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
   @VisibleForTesting static final AtomicLong BOOTSTRAPPED_KEYS = new AtomicLong();
   @VisibleForTesting static final AtomicLong TABLE_BOOTSTRAPS = new AtomicLong();
   @VisibleForTesting static final AtomicLong REWRITES_APPLIED = new AtomicLong();
+  @VisibleForTesting static final AtomicLong LEGACY_REBUILDS = new AtomicLong();
+
+  // POC: writes the per-table metadata in key format 1, to test restoring a format 1 state.
+  private static volatile boolean writeLegacyTableState = false;
 
   private final CatalogLoader catalogLoader;
   private final Map<String, String> writeProperties;
   private final Configuration flinkConfig;
+  private final boolean rebuildOnStaleRestore;
 
   private transient Catalog catalog;
   private transient StructLikeSerializer serializer;
   private transient ValueState<Long> location;
   private transient ListState<byte[]> fileDictionaryState;
   private transient ListState<byte[]> tableStates;
+  private transient ListState<byte[]> legacyTableStates;
   private transient Map<Integer, FileEntry> files;
   private transient Map<String, Integer> fileIds;
-  private transient Map<TableKey, RestoredTable> restoredTables;
-  private transient Map<TableKey, ActiveTable> activeTables;
+  private transient Map<Long, RestoredTable> restoredTables;
+  private transient Map<TableKey, byte[]> legacyTables;
+  private transient Map<Long, ActiveTable> activeTables;
   private transient KeyGroupRange ownedKeyGroups;
   private transient int maxParallelism;
   private transient int subtaskIndex;
   private transient int nextFileCounter;
   private transient boolean inputEnded;
 
+  @VisibleForTesting
+  static void setWriteLegacyTableState(boolean legacy) {
+    writeLegacyTableState = legacy;
+  }
+
   DynamicIndexDvDataWriter(
       CatalogLoader catalogLoader, Map<String, String> writeProperties, Configuration flinkConfig) {
     this.catalogLoader = catalogLoader;
     this.writeProperties = writeProperties;
     this.flinkConfig = flinkConfig;
+    this.rebuildOnStaleRestore =
+        new FlinkWriteConf(writeProperties, flinkConfig).upsertRebuildOnStaleRestore();
   }
 
   @Override
@@ -187,21 +208,35 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
             .getOperatorStateStore()
             .getUnionListState(
                 new ListStateDescriptor<>(
-                    "dynamic-index-dv-tables",
+                    "dynamic-index-dv-tables-v2",
                     PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
     this.restoredTables = Maps.newHashMap();
     for (byte[] encoded : tableStates.get()) {
       RestoredTable table = RestoredTable.decode(encoded);
-      restoredTables.merge(table.key, table, RestoredTable::merge);
+      restoredTables.merge(table.id, table, RestoredTable::merge);
+    }
+
+    this.legacyTableStates =
+        context
+            .getOperatorStateStore()
+            .getUnionListState(
+                new ListStateDescriptor<>(
+                    "dynamic-index-dv-tables",
+                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
+    this.legacyTables = Maps.newHashMap();
+    for (byte[] encoded : legacyTableStates.get()) {
+      legacyTables.putIfAbsent(RestoredTable.legacyKey(encoded), encoded);
     }
   }
 
   @Override
-  public void processElement(StreamRecord<DynamicRecordInternal> element) throws Exception {
-    DynamicRecordInternal record = element.getValue();
+  public void processElement(
+      StreamRecord<Tuple2<SerializedEqualityValues, DynamicRecordInternal>> element)
+      throws Exception {
+    DynamicRecordInternal record = element.getValue().f1;
     // A bootstrap moves the keyed state to the keys it indexes; this record keeps its own key.
     Object recordKey = getCurrentKey();
-    ActiveTable table = activate(record);
+    ActiveTable table = activate(DynamicIndexDvKeys.tableId(element.getValue().f0), record);
     setCurrentKey(recordKey);
     Preconditions.checkState(
         table.equalityFieldIds.equals(record.equalityFields()),
@@ -213,17 +248,18 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     RowData row = record.rowData();
     switch (row.getRowKind()) {
       case INSERT, UPDATE_AFTER -> {
-        retire();
+        retire(table);
         append(table, record);
       }
-      case DELETE -> retire();
+      case DELETE -> retire(table);
       case UPDATE_BEFORE -> {
         // upsert: the UPDATE_AFTER retires the previous row by key
       }
     }
   }
 
-  private void retire() throws IOException {
+  /** Deletes the key's live row, addressed by the table's current name in case it was renamed. */
+  private void retire(ActiveTable table) throws IOException {
     Long packed = location.value();
     if (packed != null) {
       FileEntry file = files.get((int) (packed >>> 32));
@@ -231,8 +267,8 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
           DELETES,
           new StreamRecord<>(
               new DynamicDvPosition(
-                  file.tableName,
-                  file.branch,
+                  table.key.tableName(),
+                  table.key.branch(),
                   file.path,
                   packed & MAX_POSITION,
                   file.specId,
@@ -278,48 +314,26 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
    * Sets a table up on its first record on this subtask: loads it, checks a restored index against
    * the table, and indexes the owned keys of key groups no subtask has indexed yet.
    */
-  private ActiveTable activate(DynamicRecordInternal record) throws IOException {
-    TableKey key = new TableKey(record.tableName(), record.branch());
-    ActiveTable active = activeTables.get(key);
+  private ActiveTable activate(long tableId, DynamicRecordInternal record) throws IOException {
+    ActiveTable active = activeTables.get(tableId);
     if (active != null) {
+      if (!active.key.tableName().equals(record.tableName())
+          || !active.key.branch().equals(record.branch())) {
+        follow(active, record);
+      }
+
       return active;
     }
 
-    Table table = catalog.loadTable(TableIdentifier.parse(key.tableName()));
-    Preconditions.checkState(
-        TableUtil.formatVersion(table) >= 3,
-        "Upsert mode 'index-dv' requires format version 3 or later, table %s is version %s",
-        table.name(),
-        TableUtil.formatVersion(table));
-    Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
-    Preconditions.checkState(
-        record.equalityFields().equals(identifierFieldIds),
-        "POC: index-dv in the dynamic sink requires the equality fields %s of table %s to be its"
-            + " identifier fields %s",
-        record.equalityFields(),
-        table.name(),
-        identifierFieldIds);
-
-    RestoredTable restored = restoredTables.get(key);
-    active = new ActiveTable(key, table, record.equalityFields());
+    TableKey key = new TableKey(record.tableName(), record.branch());
+    Table table = load(tableId, key, record.equalityFields());
+    RestoredTable restored = restoredTables.get(tableId);
+    active = new ActiveTable(tableId, key, table, record.equalityFields());
     boolean[] covered = new boolean[maxParallelism];
     if (restored != null) {
-      Preconditions.checkState(
-          restored.equalityFieldIds.equals(record.equalityFields()),
-          "POC: equality fields of table %s changed from %s to %s since the restored index was"
-              + " built; index-dv cannot follow a key change",
-          table.name(),
-          restored.equalityFieldIds,
-          record.equalityFields());
-      active.lastSeenSnapshotId = restored.lastSeenSnapshotId;
-      active.coveredRanges.addAll(restored.coveredRanges);
-      for (int[] range : restored.coveredRanges) {
-        for (int group = range[0]; group <= range[1]; group++) {
-          covered[group] = true;
-        }
-      }
-
-      checkRestoredIndexIsCurrent(active);
+      resume(active, restored, covered);
+    } else if (legacyTables.containsKey(key)) {
+      discardLegacyIndex(active);
     }
 
     boolean missing = false;
@@ -339,8 +353,170 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
       }
     }
 
-    activeTables.put(key, active);
+    activeTables.put(tableId, active);
     return active;
+  }
+
+  /** Takes over the restored index of a table and marks the key groups it covers. */
+  private void resume(ActiveTable active, RestoredTable restored, boolean[] covered) {
+    checkSameTable(
+        active.id,
+        restored.tableName,
+        restored.uuid,
+        restored.branch,
+        active.table.name(),
+        active.uuid,
+        active.key.branch());
+    Preconditions.checkState(
+        restored.equalityFieldIds.equals(active.equalityFieldIds),
+        "POC: equality fields of table %s changed from %s to %s since the restored index was"
+            + " built; index-dv cannot follow a key change",
+        active.table.name(),
+        restored.equalityFieldIds,
+        active.equalityFieldIds);
+    active.lastSeenSnapshotId = restored.lastSeenSnapshotId;
+    active.coveredRanges.addAll(restored.coveredRanges);
+    for (int[] range : restored.coveredRanges) {
+      for (int group = range[0]; group <= range[1]; group++) {
+        covered[group] = true;
+      }
+    }
+
+    checkRestoredIndexIsCurrent(active);
+  }
+
+  /** Loads the table of a record and checks that index-dv can write it under this table id. */
+  private Table load(long tableId, TableKey key, Set<Integer> equalityFields) {
+    Table table = catalog.loadTable(TableIdentifier.parse(key.tableName()));
+    long currentId = DynamicIndexDvKeys.tableId(table.uuid(), key.branch());
+    Preconditions.checkState(
+        currentId == tableId,
+        "A record for table %s branch %s was keyed for table id %s, but the table now has UUID %s"
+            + " (table id %s): the table was dropped and re-created while the record was in"
+            + " flight. Restart the job; its records are then keyed for the current table.",
+        key.tableName(),
+        key.branch(),
+        tableId,
+        table.uuid(),
+        currentId);
+    Preconditions.checkState(
+        TableUtil.formatVersion(table) >= 3,
+        "Upsert mode 'index-dv' requires format version 3 or later, table %s is version %s",
+        table.name(),
+        TableUtil.formatVersion(table));
+    Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
+    Preconditions.checkState(
+        equalityFields.equals(identifierFieldIds),
+        "POC: index-dv in the dynamic sink requires the equality fields %s of table %s to be its"
+            + " identifier fields %s",
+        equalityFields,
+        table.name(),
+        identifierFieldIds);
+    return table;
+  }
+
+  /**
+   * Follows a rename: a record of the same table id under another name or branch is the same table
+   * only when the name resolves to the same UUID and branch; otherwise two tables collide.
+   */
+  private void follow(ActiveTable active, DynamicRecordInternal record) {
+    Table table = catalog.loadTable(TableIdentifier.parse(record.tableName()));
+    checkSameTable(
+        active.id,
+        active.key.tableName(),
+        active.uuid,
+        active.key.branch(),
+        table.name(),
+        table.uuid(),
+        record.branch());
+    LOG.info(
+        "Table {} branch {} (UUID {}) is now named {}; its index follows the table",
+        active.key.tableName(),
+        active.key.branch(),
+        active.uuid,
+        record.tableName());
+    active.key = new TableKey(record.tableName(), active.key.branch());
+    active.table = table;
+  }
+
+  private static void checkSameTable(
+      long tableId,
+      String knownName,
+      UUID knownUuid,
+      String knownBranch,
+      String name,
+      UUID uuid,
+      String branch) {
+    Preconditions.checkState(
+        knownUuid.equals(uuid) && knownBranch.equals(branch),
+        "Table id collision in the index-dv state: table %s branch %s (UUID %s) and table %s"
+            + " branch %s (UUID %s) both have table id %s, so their keys would share index"
+            + " entries. Write one of them with another sink.",
+        knownName,
+        knownBranch,
+        knownUuid,
+        name,
+        branch,
+        uuid,
+        tableId);
+  }
+
+  /**
+   * Handles restored per-table metadata in key format 1, whose keys carry the table name: this
+   * version never reads those keys, so the table is indexed from its head as if it had no state,
+   * when {@code upsert-stale-restore=rebuild} allows it and the head holds every data file the
+   * restored state knows for the table.
+   *
+   * <p>shortcut: the format 1 keys stay in the keyed state; upgrade to deleting them by prefix.
+   */
+  private void discardLegacyIndex(ActiveTable active) throws IOException {
+    String name = active.key.tableName();
+    String branch = active.key.branch();
+    Preconditions.checkState(
+        rebuildOnStaleRestore,
+        "Restored index-dv state of table %s branch %s uses key format 1, which keys the index by"
+            + " table name; this version keys it by table id (format %s) and cannot read it. Start"
+            + " the job without state so the index bootstraps from the head, or set"
+            + " upsert-stale-restore=rebuild to rebuild the index of this table from its head.",
+        name,
+        branch,
+        DynamicIndexDvKeys.KEY_FORMAT_VERSION);
+    Set<String> unknown = Sets.newHashSet();
+    for (FileEntry file : files.values()) {
+      if (file.tableName.equals(name) && file.branch.equals(branch)) {
+        unknown.add(file.path);
+      }
+    }
+
+    Snapshot head = active.table.snapshot(branch);
+    if (!unknown.isEmpty() && head != null) {
+      try (CloseableIterable<FileScanTask> tasks =
+          active.table.newScan().useSnapshot(head.snapshotId()).planFiles()) {
+        for (FileScanTask task : tasks) {
+          unknown.remove(task.file().location());
+        }
+      }
+    }
+
+    Preconditions.checkState(
+        unknown.isEmpty(),
+        "Cannot rebuild the index-dv index of table %s branch %s from key format 1: the restored"
+            + " state holds %s data file(s) of this table that its head does not hold, for example"
+            + " %s, and the restored committer may still commit them over the rebuilt index."
+            + " Restore the checkpoint or savepoint that matches the head, or start the job"
+            + " without state.",
+        name,
+        branch,
+        unknown.size(),
+        unknown.isEmpty() ? null : unknown.iterator().next());
+    legacyTables.remove(active.key);
+    LEGACY_REBUILDS.incrementAndGet();
+    LOG.warn(
+        "Rebuilding the index-dv index of table {} branch {} on subtask {} from its head: the"
+            + " restored state uses key format 1",
+        name,
+        branch,
+        subtaskIndex);
   }
 
   /** Fails when the table holds data files the restored index of this table has never seen. */
@@ -484,7 +660,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
       for (Record record : rows) {
         SerializedEqualityValues key =
             DynamicIndexDvKeys.compose(
-                active.key,
+                active.prefix,
                 serializer.serializeKey(
                     keyWrapper.wrap(keyProjection.wrap(record)), keySchema.asStruct()));
         int group = KeyGroupRangeAssignment.assignToKeyGroup(key, maxParallelism);
@@ -513,7 +689,26 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
   @SuppressWarnings("checkstyle:CyclomaticComplexity")
   private void applyRewrites(ActiveTable active) throws IOException {
     Table table = active.table;
-    table.refresh();
+    try {
+      table.refresh();
+    } catch (IllegalStateException e) {
+      throw new IllegalStateException(
+          String.format(
+              "Cannot refresh table %s branch %s (UUID %s), which this subtask wrote since the last"
+                  + " checkpoint; it was probably dropped and re-created, and its uncommitted rows"
+                  + " would go to the new table. Restart the job.",
+              active.key.tableName(), active.key.branch(), active.uuid),
+          e);
+    }
+
+    Preconditions.checkState(
+        active.uuid.equals(table.uuid()),
+        "Table %s branch %s changed UUID from %s to %s while this subtask wrote to it; its"
+            + " uncommitted rows would go to the new table. Restart the job.",
+        active.key.tableName(),
+        active.key.branch(),
+        active.uuid,
+        table.uuid());
     Snapshot head = table.snapshot(active.key.branch());
     Long lastSeen = active.lastSeenSnapshotId;
     if (head == null || lastSeen == null || head.snapshotId() == lastSeen) {
@@ -599,23 +794,32 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     }
 
     fileDictionaryState.update(encoded);
-    Map<TableKey, RestoredTable> known = Maps.newHashMap(restoredTables);
+    Map<Long, RestoredTable> known = Maps.newHashMap(restoredTables);
     for (ActiveTable active : activeTables.values()) {
       known.put(
-          active.key,
+          active.id,
           new RestoredTable(
-              active.key,
+              active.id,
+              active.uuid,
+              active.key.branch(),
+              active.key.tableName(),
               active.lastSeenSnapshotId,
               active.equalityFieldIds,
               active.coveredRanges));
     }
 
     List<byte[]> tables = Lists.newArrayListWithCapacity(known.size());
+    List<byte[]> legacy = Lists.newArrayList(legacyTables.values());
     for (RestoredTable table : known.values()) {
-      tables.add(table.encode());
+      if (writeLegacyTableState) {
+        legacy.add(table.encodeLegacy());
+      } else {
+        tables.add(table.encode());
+      }
     }
 
     tableStates.update(tables);
+    legacyTableStates.update(legacy);
   }
 
   @Override
@@ -691,8 +895,9 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
 
   /** A table this subtask has seen in this run, with its writers. */
   private final class ActiveTable {
-    private final TableKey key;
-    private final Table table;
+    private final long id;
+    private final byte[] prefix;
+    private final UUID uuid;
     private final Set<Integer> equalityFieldIds;
     private final List<int[]> coveredRanges = Lists.newArrayList();
     private final Map<String, TargetWriters> targets = Maps.newHashMap();
@@ -701,10 +906,15 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     private final FileFormat format;
     private final long targetFileSize;
     private final Map<String, String> tableWriteProperties;
+    private TableKey key;
+    private Table table;
     private Long lastSeenSnapshotId;
     private boolean dirty;
 
-    private ActiveTable(TableKey key, Table table, Set<Integer> equalityFieldIds) {
+    private ActiveTable(long id, TableKey key, Table table, Set<Integer> equalityFieldIds) {
+      this.id = id;
+      this.prefix = DynamicIndexDvKeys.prefix(id);
+      this.uuid = table.uuid();
       this.key = key;
       this.table = table;
       this.equalityFieldIds = equalityFieldIds;
@@ -723,7 +933,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
       FileWriterFactory<RowData> factory =
           writerFactories.computeIfAbsent(
               schema.schemaId(),
-              id ->
+              schemaId ->
                   new FlinkFileWriterFactory.Builder(table)
                       .dataFileFormat(format)
                       .dataSchema(schema)
@@ -816,19 +1026,32 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     }
   }
 
-  /** The per-table index metadata kept in union state: merged across subtasks on restore. */
+  /**
+   * The per-table index metadata kept in union state, merged across subtasks on restore. It names
+   * the key format, and the table UUID and branch its id stands for, to detect collisions.
+   */
   private static final class RestoredTable {
-    private final TableKey key;
+    private final long id;
+    private final UUID uuid;
+    private final String branch;
+    private final String tableName;
     private final Long lastSeenSnapshotId;
     private final Set<Integer> equalityFieldIds;
     private final List<int[]> coveredRanges;
 
+    @SuppressWarnings("checkstyle:ParameterNumber")
     private RestoredTable(
-        TableKey key,
+        long id,
+        UUID uuid,
+        String branch,
+        String tableName,
         Long lastSeenSnapshotId,
         Set<Integer> equalityFieldIds,
         List<int[]> coveredRanges) {
-      this.key = key;
+      this.id = id;
+      this.uuid = uuid;
+      this.branch = branch;
+      this.tableName = tableName;
       this.lastSeenSnapshotId = lastSeenSnapshotId;
       this.equalityFieldIds = equalityFieldIds;
       this.coveredRanges = coveredRanges;
@@ -836,10 +1059,12 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
 
     /** Re-applying a rewrite is harmless, so after a rescale resume from the oldest view. */
     private static RestoredTable merge(RestoredTable one, RestoredTable other) {
+      checkSameTable(
+          one.id, one.tableName, one.uuid, one.branch, other.tableName, other.uuid, other.branch);
       Preconditions.checkState(
           one.equalityFieldIds.equals(other.equalityFieldIds),
           "POC: subtasks disagree on the equality fields of table %s: %s and %s",
-          one.key.tableName(),
+          one.tableName,
           one.equalityFieldIds,
           other.equalityFieldIds);
       Long lastSeen;
@@ -853,34 +1078,65 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
 
       List<int[]> ranges = Lists.newArrayList(one.coveredRanges);
       ranges.addAll(other.coveredRanges);
-      return new RestoredTable(one.key, lastSeen, one.equalityFieldIds, ranges);
+      return new RestoredTable(
+          one.id, one.uuid, one.branch, one.tableName, lastSeen, one.equalityFieldIds, ranges);
     }
 
     private byte[] encode() throws IOException {
       ByteArrayOutputStream bytes = new ByteArrayOutputStream();
       try (DataOutputStream out = new DataOutputStream(bytes)) {
-        out.writeUTF(key.tableName());
-        out.writeUTF(key.branch());
-        out.writeBoolean(lastSeenSnapshotId != null);
-        out.writeLong(lastSeenSnapshotId != null ? lastSeenSnapshotId : 0L);
-        out.writeInt(equalityFieldIds.size());
-        for (int id : equalityFieldIds) {
-          out.writeInt(id);
-        }
-
-        out.writeInt(coveredRanges.size());
-        for (int[] range : coveredRanges) {
-          out.writeInt(range[0]);
-          out.writeInt(range[1]);
-        }
+        out.writeInt(DynamicIndexDvKeys.KEY_FORMAT_VERSION);
+        out.writeLong(id);
+        out.writeLong(uuid.getMostSignificantBits());
+        out.writeLong(uuid.getLeastSignificantBits());
+        out.writeUTF(branch);
+        out.writeUTF(tableName);
+        writeIndexState(out);
       }
 
       return bytes.toByteArray();
     }
 
+    /** Key format 1: the table name and branch identify the table. */
+    private byte[] encodeLegacy() throws IOException {
+      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      try (DataOutputStream out = new DataOutputStream(bytes)) {
+        out.writeUTF(tableName);
+        out.writeUTF(branch);
+        writeIndexState(out);
+      }
+
+      return bytes.toByteArray();
+    }
+
+    private void writeIndexState(DataOutputStream out) throws IOException {
+      out.writeBoolean(lastSeenSnapshotId != null);
+      out.writeLong(lastSeenSnapshotId != null ? lastSeenSnapshotId : 0L);
+      out.writeInt(equalityFieldIds.size());
+      for (int fieldId : equalityFieldIds) {
+        out.writeInt(fieldId);
+      }
+
+      out.writeInt(coveredRanges.size());
+      for (int[] range : coveredRanges) {
+        out.writeInt(range[0]);
+        out.writeInt(range[1]);
+      }
+    }
+
     private static RestoredTable decode(byte[] encoded) throws IOException {
       try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(encoded))) {
-        TableKey key = new TableKey(in.readUTF(), in.readUTF());
+        int version = in.readInt();
+        Preconditions.checkState(
+            version == DynamicIndexDvKeys.KEY_FORMAT_VERSION,
+            "Restored index-dv state uses key format %s; this version reads format %s. Start the"
+                + " job without state.",
+            version,
+            DynamicIndexDvKeys.KEY_FORMAT_VERSION);
+        long id = in.readLong();
+        UUID uuid = new UUID(in.readLong(), in.readLong());
+        String branch = in.readUTF();
+        String tableName = in.readUTF();
         boolean hasLastSeen = in.readBoolean();
         long lastSeen = in.readLong();
         Set<Integer> ids = Sets.newHashSet();
@@ -893,7 +1149,15 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
           ranges.add(new int[] {in.readInt(), in.readInt()});
         }
 
-        return new RestoredTable(key, hasLastSeen ? lastSeen : null, ids, ranges);
+        return new RestoredTable(
+            id, uuid, branch, tableName, hasLastSeen ? lastSeen : null, ids, ranges);
+      }
+    }
+
+    /** The (table name, branch) of per-table metadata in key format 1. */
+    private static TableKey legacyKey(byte[] encoded) throws IOException {
+      try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(encoded))) {
+        return new TableKey(in.readUTF(), in.readUTF());
       }
     }
   }

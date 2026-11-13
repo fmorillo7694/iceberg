@@ -24,6 +24,7 @@ import java.util.UUID;
 import org.apache.flink.annotation.Experimental;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
 import org.apache.flink.api.connector.sink2.Sink;
@@ -31,6 +32,7 @@ import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.api.connector.sink2.SupportsCommitter;
 import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
@@ -485,11 +487,12 @@ public class DynamicIcebergSink
     }
 
     /**
-     * POC: in the index-dv mode, upsert records are keyed by (table, branch, equality key) and
-     * written before the SinkV2 writer; a relay writer hands their results to the aggregator.
+     * POC: in the index-dv mode, upsert records are keyed by (table id, equality key) and written
+     * before the SinkV2 writer; a relay writer hands their results to the aggregator.
      */
     private DataStream<CommittableMessage<DynamicWriteResult>> indexDvTopology(
-        DataStream<DynamicRecordInternal> records, Configuration flinkConfig) {
+        DataStream<Tuple2<SerializedEqualityValues, DynamicRecordInternal>> records,
+        Configuration flinkConfig) {
       // Unaligned barriers overtake in-flight results, so a DV could commit before its data file.
       Preconditions.checkState(
           !records.getExecutionEnvironment().getCheckpointConfig().isUnalignedCheckpointsEnabled(),
@@ -620,8 +623,12 @@ public class DynamicIcebergSink
       if (new FlinkWriteConf(writeOptions, readableConfig).upsertIndexDvMode()) {
         // Filter each input at its own parallelism so the filter chains to it: a rebalance in
         // front of the key-by would reorder the records of a key.
+        long refreshMs = flinkDynamicSinkConf.cacheRefreshMs();
         indexDvResults =
-            indexDvTopology(upserts(updated, true).union(upserts(converted, true)), flinkConfig);
+            indexDvTopology(
+                keyed(upserts(updated, true), refreshMs)
+                    .union(keyed(upserts(converted, true), refreshMs)),
+                flinkConfig);
         shuffleInput = upserts(updated, false).union(upserts(converted, false));
       }
 
@@ -642,6 +649,17 @@ public class DynamicIcebergSink
       }
 
       return result;
+    }
+
+    /** Attaches the index key at the input's parallelism, chained to it, to keep key order. */
+    private SingleOutputStreamOperator<Tuple2<SerializedEqualityValues, DynamicRecordInternal>>
+        keyed(SingleOutputStreamOperator<DynamicRecordInternal> records, long refreshMs) {
+      return records
+          .map(
+              new DynamicIndexDvKeyAssigner(catalogLoader, refreshMs),
+              Types.TUPLE(TypeInformation.of(SerializedEqualityValues.class), records.getType()))
+          .name(operatorName("index-dv-key"))
+          .setParallelism(records.getParallelism());
     }
 
     private static SingleOutputStreamOperator<DynamicRecordInternal> upserts(
