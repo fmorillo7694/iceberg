@@ -20,6 +20,8 @@ package org.apache.iceberg.flink.sink;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -83,7 +85,6 @@ import org.slf4j.LoggerFactory;
 class IndexDvCommits {
   private static final Logger LOG = LoggerFactory.getLogger(IndexDvCommits.class);
   private static final int MAX_ATTEMPTS = 4;
-  private static final int MAX_REWRITE_HOPS = 8;
 
   @VisibleForTesting static final AtomicLong REBASED_DVS = new AtomicLong();
   @VisibleForTesting static final AtomicLong RETRIES = new AtomicLong();
@@ -243,9 +244,14 @@ class IndexDvCommits {
       DeleteLoader loader,
       Map<String, Target> rewrites) {
     Schema keySchema = TypeUtil.select(table.schema(), equalityFieldIds);
-    String currentPath = path;
-    Roaring64Bitmap current = positions;
-    for (int depth = 0; depth < MAX_REWRITE_HOPS; depth++) {
+    // Each queued file was added by the rewrite that removed the one before it, so its own removal
+    // is later in the finite history: the walk ends.
+    Deque<Pair<String, Roaring64Bitmap>> pending = new ArrayDeque<>();
+    pending.add(Pair.of(path, positions));
+    while (!pending.isEmpty()) {
+      Pair<String, Roaring64Bitmap> next = pending.poll();
+      String currentPath = next.first();
+      Roaring64Bitmap current = next.second();
       Pair<Snapshot, DataFile> removal = removed.of(currentPath);
       Snapshot rewrite = removal.first();
       Preconditions.checkState(
@@ -259,7 +265,7 @@ class IndexDvCommits {
       Roaring64Bitmap wanted = current.clone();
       wanted.andNot(deletedAt(table, rewrite.parentId(), currentPath, loader));
       if (wanted.isEmpty()) {
-        return;
+        continue;
       }
 
       Set<SerializedEqualityValues> keys = Sets.newHashSet();
@@ -273,8 +279,6 @@ class IndexDvCommits {
             }
           });
 
-      String nextPath = null;
-      Roaring64Bitmap next = null;
       SnapshotChanges changes = SnapshotChanges.builderFor(table).snapshot(rewrite).build();
       for (DataFile added : changes.addedDataFiles()) {
         Roaring64Bitmap found = new Roaring64Bitmap();
@@ -292,9 +296,7 @@ class IndexDvCommits {
         }
 
         if (!removed.isLive(added.location())) {
-          // shortcut: follows one rewritten-again file per hop
-          nextPath = added.location();
-          next = found;
+          pending.add(Pair.of(added.location(), found));
         } else {
           rewrites
               .computeIfAbsent(added.location(), p -> new Target(added.specId(), added.partition()))
@@ -302,16 +304,7 @@ class IndexDvCommits {
               .or(found);
         }
       }
-
-      if (nextPath == null) {
-        return;
-      }
-
-      currentPath = nextPath;
-      current = next;
     }
-
-    throw new IllegalStateException("POC: too many rewrites to rebase DV for " + path);
   }
 
   private static Roaring64Bitmap deletedAt(
