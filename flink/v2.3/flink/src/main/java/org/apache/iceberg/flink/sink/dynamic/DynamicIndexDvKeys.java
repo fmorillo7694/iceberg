@@ -22,6 +22,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
@@ -54,15 +55,26 @@ final class DynamicIndexDvKeys {
   }
 
   static SerializedEqualityValues compose(TableKey table, SerializedEqualityValues key) {
+    return compose(prefix(table.tableName(), table.branch()), key);
+  }
+
+  /** The encoded (table, branch) part of a key, to be reused for every key of that pair. */
+  static byte[] prefix(String tableName, String branch) {
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(bytes)) {
-      out.writeUTF(table.tableName());
-      out.writeUTF(table.branch());
-      out.write(key.data());
+      out.writeUTF(tableName);
+      out.writeUTF(branch);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
 
-    return new SerializedEqualityValues(bytes.toByteArray());
+    return bytes.toByteArray();
+  }
+
+  static SerializedEqualityValues compose(byte[] prefix, SerializedEqualityValues key) {
+    byte[] data = key.data();
+    byte[] composed = Arrays.copyOf(prefix, prefix.length + data.length);
+    System.arraycopy(data, 0, composed, prefix.length, data.length);
+    return new SerializedEqualityValues(composed);
   }
 }
