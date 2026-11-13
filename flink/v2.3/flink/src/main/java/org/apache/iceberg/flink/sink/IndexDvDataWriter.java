@@ -585,8 +585,9 @@ class IndexDvDataWriter extends AbstractStreamOperator<FlinkWriteResult>
     try (CloseableIterable<Record> rows = filter != null ? filter.filter(records) : records) {
       for (Record record : rows) {
         SerializedEqualityValues key =
-            serializer.serializeKey(
-                keyWrapper.wrap(keyProjection.wrap(record)), keySchema.asStruct());
+            IndexDvKeySelector.prefixed(
+                serializer.serializeKey(
+                    keyWrapper.wrap(keyProjection.wrap(record)), keySchema.asStruct()));
         if (ownedKeyGroups.contains(
             KeyGroupRangeAssignment.assignToKeyGroup(key, maxParallelism))) {
           getKeyedStateBackend().setCurrentKey(key);

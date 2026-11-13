@@ -26,12 +26,16 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.flink.RowDataWrapper;
 import org.apache.iceberg.flink.maintenance.operator.SerializedEqualityValues;
 import org.apache.iceberg.flink.maintenance.operator.StructLikeSerializer;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.StructProjection;
 
 /** POC: keys rows by the serialized values of their equality fields, not by a hash of them. */
 class IndexDvKeySelector implements KeySelector<RowData, SerializedEqualityValues> {
+  // POC: a test-only prefix on every key, to compare with the dynamic sink's key encoding.
+  private static volatile byte[] testKeyPrefix = null;
+
   private final Schema schema;
   private final RowType flinkRowType;
   private final Schema keySchema;
@@ -55,6 +59,23 @@ class IndexDvKeySelector implements KeySelector<RowData, SerializedEqualityValue
     }
 
     Types.StructType keyType = keySchema.asStruct();
-    return serializer.serializeKey(projection.wrap(wrapper.wrap(row)), keyType);
+    return prefixed(serializer.serializeKey(projection.wrap(wrapper.wrap(row)), keyType));
+  }
+
+  @VisibleForTesting
+  static void setTestKeyPrefix(byte[] prefix) {
+    testKeyPrefix = prefix;
+  }
+
+  static SerializedEqualityValues prefixed(SerializedEqualityValues key) {
+    byte[] prefix = testKeyPrefix;
+    if (prefix == null) {
+      return key;
+    }
+
+    byte[] data = new byte[prefix.length + key.data().length];
+    System.arraycopy(prefix, 0, data, 0, prefix.length);
+    System.arraycopy(key.data(), 0, data, prefix.length, key.data().length);
+    return new SerializedEqualityValues(data);
   }
 }
