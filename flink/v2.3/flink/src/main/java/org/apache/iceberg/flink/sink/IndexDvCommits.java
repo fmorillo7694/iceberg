@@ -179,6 +179,8 @@ class IndexDvCommits {
     Set<String> touched = Sets.newHashSet(rewrites.keySet());
     keep.forEach(dv -> touched.add(dv.referencedDataFile()));
     Map<String, DeleteFile> live = liveDvs(table, head, touched);
+    long startSequence = table.snapshot(start).sequenceNumber();
+    boolean replacesNewerDv = false;
 
     for (DeleteFile dv : keep) {
       String path = dv.referencedDataFile();
@@ -193,6 +195,7 @@ class IndexDvCommits {
           && contains(ours, bitmap(loader.loadPositionDeletes(ImmutableList.of(liveDv), path)))) {
         rowDelta.addDeletes(dv);
         rowDelta.removeDeletes(liveDv);
+        replacesNewerDv |= addedAfter(liveDv, startSequence);
       } else {
         // The writer did not see the live DV, for example one written by a rebase: merge them.
         rewrites
@@ -210,6 +213,7 @@ class IndexDvCommits {
             .positions
             .or(bitmap(loader.loadPositionDeletes(ImmutableList.of(liveDv), entry.getKey())));
         rowDelta.removeDeletes(liveDv);
+        replacesNewerDv |= addedAfter(liveDv, startSequence);
       }
     }
 
@@ -217,8 +221,9 @@ class IndexDvCommits {
       rowDelta.addDeletes(dv);
     }
 
-    // After a rebase every DV is computed against the head, so validate from there.
-    rowDelta.validateFromSnapshot(removed.rebased() ? head.snapshotId() : start);
+    // After a rebase, or when a DV committed since start (a DV rewrite) is replaced, every DV is
+    // computed against the head, so validate from there.
+    rowDelta.validateFromSnapshot(removed.rebased() || replacesNewerDv ? head.snapshotId() : start);
     rowDelta.validateDataFilesExist(touched);
     rowDelta.validateDeletedFiles();
     rowDelta.validateNoConflictingDeleteFiles();
@@ -478,6 +483,10 @@ class IndexDvCommits {
     }
 
     return live;
+  }
+
+  private static boolean addedAfter(DeleteFile dv, long sequenceNumber) {
+    return dv.fileSequenceNumber() != null && dv.fileSequenceNumber() > sequenceNumber;
   }
 
   private static long validationStart(
