@@ -104,7 +104,11 @@ public class FlinkManifestUtil {
       int formatVersion)
       throws IOException {
     return writeCompletedFiles(
-        result, outputFileSupplier, spec, ImmutableMap.of(spec.specId(), spec), formatVersion);
+        result,
+        outputFileSupplier,
+        spec,
+        spec != null ? ImmutableMap.of(spec.specId(), spec) : ImmutableMap.of(),
+        formatVersion);
   }
 
   /**
