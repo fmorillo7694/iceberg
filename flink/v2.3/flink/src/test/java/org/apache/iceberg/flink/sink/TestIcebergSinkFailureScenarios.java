@@ -19,6 +19,7 @@
 package org.apache.iceberg.flink.sink;
 
 import static org.apache.iceberg.flink.TestFixtures.DATABASE;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.File;
 import java.io.IOException;
@@ -62,14 +63,23 @@ import org.apache.flink.types.RowKind;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
 import org.apache.iceberg.ManifestFiles;
 import org.apache.iceberg.ManifestReader;
+import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.RewriteFiles;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.BaseDeleteLoader;
+import org.apache.iceberg.data.DeleteLoader;
+import org.apache.iceberg.data.FileHelpers;
+import org.apache.iceberg.data.GenericAppenderHelper;
 import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.flink.FlinkWriteOptions;
@@ -86,6 +96,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.ContentFileUtil;
+import org.apache.iceberg.util.Pair;
+import org.apache.iceberg.util.StructLikeMap;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -112,6 +124,7 @@ class TestIcebergSinkFailureScenarios {
 
   @TempDir private Path checkpointDir;
   @TempDir private Path savepointDir;
+  @TempDir private Path compactionDir;
 
   private String mode;
   private Table table;
@@ -129,6 +142,8 @@ class TestIcebergSinkFailureScenarios {
                 PartitionSpec.unpartitioned(),
                 ImmutableMap.of(TableProperties.FORMAT_VERSION, "3"));
     Control.reset();
+    IndexDvDataWriter.REWRITES_APPLIED.set(0);
+    IndexDvCommits.REBASED_DVS.set(0);
   }
 
   /** 1: failover to the latest checkpoint while input keeps flowing. */
@@ -239,6 +254,252 @@ class TestIcebergSinkFailureScenarios {
     cancelDuringCheckpoint();
     runToEnd(0, null, null, 0);
     report("s6b-cancel-in-checkpoint-no-state");
+  }
+
+  /** c1: an external full rewrite lands after the latest checkpoint, then restore it. */
+  @Test
+  void c1RewriteAfterLatestCheckpoint() throws Exception {
+    String latest = runHeldAt(200);
+    compact(null);
+    runToEnd(0, latest, null, 0);
+    expect(report("c1-full-rewrite-after-latest", RECORDS), "OK");
+  }
+
+  /** c2: as c1, rewriting only one bucket of a bucket(id, 3) table. */
+  @Test
+  void c2PartialRewriteAfterLatestCheckpoint() throws Exception {
+    recreateBucketed();
+    String latest = runHeldAt(200);
+    compact(0);
+    runToEnd(0, latest, null, 0);
+    expect(report("c2-partial-rewrite-after-latest", RECORDS), "OK");
+  }
+
+  /** c3a: restore a checkpoint behind the table where the only newer commit is a compaction. */
+  @Test
+  void c3aStaleRestoreOnlyCompactionAfter() throws Exception {
+    String behind;
+    try (Cluster cluster = new Cluster()) {
+      Control.holdAt = 160;
+      JobClient job = start(cluster, 0, null, null, 0);
+      awaitHoldAndCommits(job);
+      behind = latestCheckpoint(job.getJobID());
+      compact(null);
+      awaitCheckpoints(job, CHECKPOINTS_TO_COMMIT);
+      cancel(job);
+    }
+
+    Control.holdAt = -1;
+    runToEnd(0, behind, null, 0);
+    expect(report("c3a-stale-only-compaction-after", RECORDS), "OK");
+  }
+
+  /** c3b: sink commits after the restored checkpoint, then a compaction rewrites those files. */
+  @Test
+  void c3bStaleRestoreCommitsThenCompaction() throws Exception {
+    String behind = runStaleThenCancel(false);
+    compact(null);
+    runToEnd(0, behind, null, 0);
+    expect(report("c3b-stale-commits-then-compaction", RECORDS), "LOUD");
+  }
+
+  /** c3c: a compaction, then sink commits, both after the restored checkpoint. */
+  @Test
+  void c3cStaleRestoreCompactionThenCommits() throws Exception {
+    String behind = runStaleThenCancel(true);
+    runToEnd(0, behind, null, 0);
+    expect(report("c3c-stale-compaction-then-commits", RECORDS), "LOUD");
+  }
+
+  /** c4: rows retired by DVs stay deleted when the rewrite drops them and the job restores. */
+  @Test
+  void c4RewriteOfFilesWithLiveDvsKeepsDeletes() throws Exception {
+    String latest = runHeldAt(200);
+    int liveDvsBefore = deleteStats()[2];
+    compact(null);
+    Control.endAt = 200;
+    runToEnd(0, latest, null, 0);
+    System.out.printf("NOTE c4 live DVs rewritten by the compaction=%d%n", liveDvsBefore);
+    String verdict = report("c4-rewrite-drops-dv-rows", 200);
+    if ("D".equals(mode)) {
+      assertThat(liveDvsBefore).isPositive();
+    }
+
+    expect(verdict, "OK");
+  }
+
+  /** c5: as c3b, then expire every snapshot but the head, so the restored one is gone. */
+  @Test
+  void c5StaleRestoreAfterCompactionAndExpire() throws Exception {
+    String behind = runStaleThenCancel(false);
+    compact(null);
+    expireAllButHead();
+    runToEnd(0, behind, null, 0);
+    expect(report("c5-stale-compaction-expired", RECORDS), "LOUD");
+  }
+
+  /** c5a: as c1, then expire every snapshot but the head; reported, not asserted. */
+  @Test
+  void c5aLatestRestoreAfterCompactionAndExpire() throws Exception {
+    String latest = runHeldAt(200);
+    compact(null);
+    expireAllButHead();
+    runToEnd(0, latest, null, 0);
+    report("c5a-latest-compaction-expired", RECORDS);
+  }
+
+  /** c6: every live DV is rewritten into a new DV file between the checkpoint and the restore. */
+  @Test
+  void c6DvRewriteAfterLatestCheckpoint() throws Exception {
+    String latest = runHeldAt(200);
+    int rewritten = rewriteDvs();
+    runToEnd(0, latest, null, 0);
+    System.out.printf("NOTE c6 DVs rewritten=%d%n", rewritten);
+    expect(report("c6-dv-rewrite-after-latest", RECORDS), "OK");
+  }
+
+  private String runHeldAt(int hold) throws Exception {
+    try (Cluster cluster = new Cluster()) {
+      Control.holdAt = hold;
+      JobClient job = start(cluster, 0, null, null, 0);
+      awaitHoldAndCommits(job);
+      String latest = latestCheckpoint(job.getJobID());
+      cancel(job);
+      Control.holdAt = -1;
+      return latest;
+    }
+  }
+
+  private String runStaleThenCancel(boolean compactBeforeCommits) throws Exception {
+    try (Cluster cluster = new Cluster()) {
+      Control.holdAt = 160;
+      JobClient job = start(cluster, 0, null, null, 0);
+      awaitHoldAndCommits(job);
+      String behind = latestCheckpoint(job.getJobID());
+      if (compactBeforeCommits) {
+        compact(null);
+      }
+
+      Control.holdAt = 280;
+      awaitHoldAndCommits(job);
+      cancel(job);
+      Control.holdAt = -1;
+      return behind;
+    }
+  }
+
+  private void awaitCheckpoints(JobClient job, int count) throws Exception {
+    int target = Control.COMPLETED_CHECKPOINTS.get() + count;
+    awaitOrFail(job, () -> Control.COMPLETED_CHECKPOINTS.get() >= target);
+  }
+
+  private void expect(String verdict, String expected) {
+    if ("D".equals(mode)) {
+      assertThat(verdict).isEqualTo(expected);
+    }
+  }
+
+  private void recreateBucketed() {
+    TableIdentifier identifier = TableIdentifier.of(DATABASE, "t_" + mode.toLowerCase(Locale.ROOT));
+    CATALOG_EXTENSION.catalog().dropTable(identifier);
+    this.table =
+        CATALOG_EXTENSION
+            .catalog()
+            .createTable(
+                identifier,
+                SimpleDataUtil.SCHEMA,
+                PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).bucket("id", 3).build(),
+                ImmutableMap.of(TableProperties.FORMAT_VERSION, "3"));
+  }
+
+  /** Rewrites the live rows of every data file, or of one bucket only, like RewriteDataFiles. */
+  private void compact(Integer bucket) throws IOException {
+    table.refresh();
+    Snapshot head = table.currentSnapshot();
+    PartitionKey partitionKey = new PartitionKey(table.spec(), table.schema());
+    Map<StructLike, List<Record>> liveByPartition =
+        StructLikeMap.create(table.spec().partitionType());
+    try (CloseableIterable<Record> records =
+        IcebergGenerics.read(table).useSnapshot(head.snapshotId()).build()) {
+      for (Record record : records) {
+        partitionKey.partition(record);
+        if (bucket == null || bucket.equals(partitionKey.get(0, Integer.class))) {
+          liveByPartition
+              .computeIfAbsent(partitionKey.copy(), k -> Lists.newArrayList())
+              .add(record.copy());
+        }
+      }
+    }
+
+    RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(head.snapshotId());
+    int removed = 0;
+    try (CloseableIterable<FileScanTask> tasks =
+        table.newScan().useSnapshot(head.snapshotId()).planFiles()) {
+      for (FileScanTask task : tasks) {
+        if (bucket == null || bucket.equals(task.file().partition().get(0, Integer.class))) {
+          rewrite.deleteFile(task.file());
+          removed++;
+        }
+      }
+    }
+
+    GenericAppenderHelper appender =
+        new GenericAppenderHelper(table, FileFormat.PARQUET, compactionDir);
+    for (Map.Entry<StructLike, List<Record>> entry : liveByPartition.entrySet()) {
+      rewrite.addFile(
+          table.spec().isUnpartitioned()
+              ? appender.writeFile(entry.getValue())
+              : appender.writeFile(entry.getKey(), entry.getValue()));
+    }
+
+    rewrite.commit();
+    System.out.printf(
+        "NOTE compaction bucket=%s removedDataFiles=%d addedDataFiles=%d%n",
+        bucket, removed, liveByPartition.size());
+  }
+
+  /** Rewrites every live DV into a new DV file, like rewrite-position-deletes. */
+  private int rewriteDvs() throws IOException {
+    table.refresh();
+    DeleteLoader loader = new BaseDeleteLoader(file -> table.io().newInputFile(file));
+    RewriteFiles rewrite =
+        table.newRewrite().validateFromSnapshot(table.currentSnapshot().snapshotId());
+    int count = 0;
+    for (DeleteFile dv : deleteFiles(table.currentSnapshot())) {
+      if (!ContentFileUtil.isDV(dv)) {
+        continue;
+      }
+
+      List<Pair<CharSequence, Long>> positions = Lists.newArrayList();
+      loader
+          .loadPositionDeletes(ImmutableList.of(dv), dv.referencedDataFile())
+          .forEach(pos -> positions.add(Pair.of(dv.referencedDataFile(), pos)));
+      DeleteFile replacement =
+          FileHelpers.writeDeleteFile(
+                  table,
+                  table
+                      .io()
+                      .newOutputFile(compactionDir.resolve("dv-" + count + ".puffin").toString()),
+                  dv.partition(),
+                  positions,
+                  3)
+              .first();
+      rewrite.deleteFile(dv).addFile(replacement, dv.dataSequenceNumber());
+      count++;
+    }
+
+    if (count > 0) {
+      rewrite.commit();
+    }
+
+    return count;
+  }
+
+  private void expireAllButHead() {
+    table.refresh();
+    table.expireSnapshots().expireOlderThan(System.currentTimeMillis() + 1).retainLast(1).commit();
+    table.refresh();
+    System.out.printf("NOTE expired, snapshots left=%d%n", snapshotCount());
   }
 
   private String cancelDuringCheckpoint() throws Exception {
@@ -408,6 +669,10 @@ class TestIcebergSinkFailureScenarios {
   // ---------------------------------------------------------------------------------------------
 
   private void report(String scenario) throws IOException {
+    report(scenario, RECORDS);
+  }
+
+  private String report(String scenario, int upTo) throws IOException {
     table.refresh();
     Map<String, Integer> actual = Maps.newHashMap();
     Map<Integer, Integer> perKey = Maps.newHashMap();
@@ -418,7 +683,7 @@ class TestIcebergSinkFailureScenarios {
       }
     }
 
-    Set<String> expected = expectedRows();
+    Set<String> expected = expectedRows(upTo);
     int actualRows = actual.values().stream().mapToInt(Integer::intValue).sum();
     int missing = (int) expected.stream().filter(row -> !actual.containsKey(row)).count();
     int unexpected = 0;
@@ -434,10 +699,19 @@ class TestIcebergSinkFailureScenarios {
     int duplicateKeys =
         "A".equals(mode) ? 0 : (int) perKey.values().stream().filter(c -> c > 1).count();
     int[] deletes = deleteStats();
+    boolean wrong =
+        missing > 0
+            || unexpected > 0
+            || duplicates > 0
+            || duplicateKeys > 0
+            || deletes[3] > 0
+            || deletes[4] > 0;
+    String verdict = !jobFailures.isEmpty() ? "LOUD" : wrong ? "SILENT_WRONG" : "OK";
     System.out.printf(
         "RESULT scenario=%s mode=%s expected=%d actual=%d duplicates=%d unexpectedRows=%d "
             + "missing=%d duplicateKeys=%d eqDeleteFilesEver=%d eqDeleteFilesLive=%d dvsLive=%d "
-            + "danglingDvs=%d snapshots=%d jobFailures=%s%n",
+            + "danglingDvs=%d multiDvFiles=%d snapshots=%d rewritesApplied=%d rebasedDvs=%d verdict=%s "
+            + "jobFailures=%s%n",
         scenario,
         mode,
         expected.size(),
@@ -450,19 +724,24 @@ class TestIcebergSinkFailureScenarios {
         deletes[1],
         deletes[2],
         deletes[3],
+        deletes[4],
         snapshotCount(),
+        IndexDvDataWriter.REWRITES_APPLIED.get(),
+        IndexDvCommits.REBASED_DVS.get(),
+        verdict,
         jobFailures);
+    return verdict;
   }
 
-  private Set<String> expectedRows() {
+  private Set<String> expectedRows(int upTo) {
     Set<String> rows = Sets.newHashSet();
     if ("A".equals(mode)) {
-      for (int i = 0; i < RECORDS; i++) {
+      for (int i = 0; i < upTo; i++) {
         rows.add(key(i) + ":v" + i);
       }
     } else {
       Map<Integer, Integer> latest = Maps.newHashMap();
-      for (int i = 0; i < RECORDS; i++) {
+      for (int i = 0; i < upTo; i++) {
         latest.put(key(i), i);
       }
 
@@ -472,7 +751,7 @@ class TestIcebergSinkFailureScenarios {
     return rows;
   }
 
-  /** Equality delete files ever committed, live eq delete files, live DVs, live dangling DVs. */
+  /** Eq delete files ever and live, live DVs, dangling DVs, extra DVs on one data file. */
   private int[] deleteStats() throws IOException {
     Set<String> everEq = Sets.newHashSet();
     for (Snapshot snapshot : table.snapshots()) {
@@ -485,7 +764,7 @@ class TestIcebergSinkFailureScenarios {
 
     Snapshot head = table.currentSnapshot();
     if (head == null) {
-      return new int[] {everEq.size(), 0, 0, 0};
+      return new int[] {everEq.size(), 0, 0, 0, 0};
     }
 
     Set<String> liveData = Sets.newHashSet();
@@ -499,6 +778,8 @@ class TestIcebergSinkFailureScenarios {
     int liveEq = 0;
     int dvs = 0;
     int dangling = 0;
+    int multiDv = 0;
+    Set<String> dvTargets = Sets.newHashSet();
     for (DeleteFile file : deleteFiles(head)) {
       if (file.content() == FileContent.EQUALITY_DELETES) {
         liveEq++;
@@ -507,10 +788,14 @@ class TestIcebergSinkFailureScenarios {
         if (!liveData.contains(file.referencedDataFile())) {
           dangling++;
         }
+
+        if (!dvTargets.add(file.referencedDataFile())) {
+          multiDv++;
+        }
       }
     }
 
-    return new int[] {everEq.size(), liveEq, dvs, dangling};
+    return new int[] {everEq.size(), liveEq, dvs, dangling, multiDv};
   }
 
   private List<DeleteFile> deleteFiles(Snapshot snapshot) throws IOException {
