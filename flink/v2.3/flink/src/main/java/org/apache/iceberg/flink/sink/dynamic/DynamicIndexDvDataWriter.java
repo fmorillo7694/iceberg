@@ -147,6 +147,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
   private transient int subtaskIndex;
   private transient int nextFileCounter;
   private transient boolean inputEnded;
+  private transient String jobId;
 
   @VisibleForTesting
   static void setWriteLegacyTableState(boolean legacy) {
@@ -166,6 +167,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
     this.subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+    this.jobId = getContainingTask().getEnvironment().getJobID().toString();
     Preconditions.checkState(
         subtaskIndex < (1 << SUBTASK_BITS), "POC: index-dv supports < 4096 writer subtasks");
     this.maxParallelism = getRuntimeContext().getTaskInfo().getMaxNumberOfParallelSubtasks();
@@ -238,6 +240,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     Object recordKey = getCurrentKey();
     ActiveTable table = activate(DynamicIndexDvKeys.tableId(element.getValue().f0), record);
     setCurrentKey(recordKey);
+    table.dirty = true;
     Preconditions.checkState(
         table.equalityFieldIds.equals(record.equalityFields()),
         "POC: equality fields of table %s changed from %s to %s; index-dv cannot follow a key"
@@ -711,6 +714,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
         table.uuid());
     Snapshot head = table.snapshot(active.key.branch());
     Long lastSeen = active.lastSeenSnapshotId;
+    clearAwaitedCommit(active, head, lastSeen);
     if (head == null || lastSeen == null || head.snapshotId() == lastSeen) {
       active.lastSeenSnapshotId = head != null ? head.snapshotId() : null;
       return;
@@ -770,18 +774,44 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     active.lastSeenSnapshotId = head.snapshotId();
   }
 
+  /**
+   * Stops refreshing an idle table once its head holds this job's commit of the last checkpoint
+   * that wrote to it, so the restored index reflects this sink's own last commit. Otherwise a
+   * restore after that commit was expired cannot be verified.
+   *
+   * <p>shortcut: a checkpoint that commits nothing for the table keeps it refreshed at every
+   * barrier until its next write; upgrade to a bounded number of refreshes.
+   */
+  private void clearAwaitedCommit(ActiveTable active, Snapshot head, Long lastSeen) {
+    Long awaited = active.awaitedCheckpointId;
+    for (Snapshot snapshot = head;
+        awaited != null
+            && snapshot != null
+            && !Long.valueOf(snapshot.snapshotId()).equals(lastSeen);
+        snapshot =
+            snapshot.parentId() == null ? null : active.table.snapshot(snapshot.parentId())) {
+      String committed = snapshot.summary().get(SinkUtil.MAX_COMMITTED_CHECKPOINT_ID);
+      if (jobId.equals(snapshot.summary().get(SinkUtil.FLINK_JOB_ID))
+          && committed != null
+          && Long.parseLong(committed) >= awaited) {
+        active.awaitedCheckpointId = null;
+        return;
+      }
+    }
+  }
+
   @Override
   public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
     super.prepareSnapshotPreBarrier(checkpointId);
     if (!inputEnded) {
       for (ActiveTable active : activeTables.values()) {
-        if (active.dirty) {
+        if (active.dirty || active.awaitedCheckpointId != null) {
           applyRewrites(active);
         }
       }
     }
 
-    flush();
+    flush(checkpointId);
   }
 
   @Override
@@ -824,16 +854,20 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
 
   @Override
   public void endInput() throws IOException {
-    flush();
+    flush(null);
     this.inputEnded = true;
   }
 
-  private void flush() throws IOException {
+  private void flush(Long checkpointId) throws IOException {
     if (inputEnded) {
       return;
     }
 
     for (ActiveTable active : activeTables.values()) {
+      if (active.dirty && checkpointId != null) {
+        active.awaitedCheckpointId = checkpointId;
+      }
+
       Map<Integer, List<DataFile>> filesBySpec = Maps.newHashMap();
       for (TargetWriters target : active.targets.values()) {
         for (DataFile file : target.complete()) {
@@ -909,6 +943,7 @@ class DynamicIndexDvDataWriter extends AbstractStreamOperator<byte[]>
     private TableKey key;
     private Table table;
     private Long lastSeenSnapshotId;
+    private Long awaitedCheckpointId;
     private boolean dirty;
 
     private ActiveTable(long id, TableKey key, Table table, Set<Integer> equalityFieldIds) {
