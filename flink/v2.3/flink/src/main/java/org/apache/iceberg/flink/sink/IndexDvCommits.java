@@ -94,6 +94,20 @@ public class IndexDvCommits {
 
   private IndexDvCommits() {}
 
+  // POC: test-only counters, public for the dynamic sink's tests in another package.
+  public static long retries() {
+    return RETRIES.get();
+  }
+
+  public static long rebasedDvs() {
+    return REBASED_DVS.get();
+  }
+
+  public static void resetCounters() {
+    RETRIES.set(0);
+    REBASED_DVS.set(0);
+  }
+
   /** Commits the files of one checkpoint, rebuilding the row delta on validation failures. */
   public static void commit(
       Table table,

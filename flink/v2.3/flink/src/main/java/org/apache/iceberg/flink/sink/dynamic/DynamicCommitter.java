@@ -28,6 +28,7 @@ import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.connector.sink2.Committer;
@@ -91,6 +92,20 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
   private final Catalog catalog;
   private final ExecutorService workerPool;
   private final boolean indexDvMode;
+
+  // POC: test-only hooks, given the table name and checkpoint id, to race commits with rewrites.
+  private static volatile BiConsumer<String, Long> beforeCommitRequests = (table, checkpoint) -> {};
+  private static volatile BiConsumer<String, Long> beforeCommitAttempt = (table, checkpoint) -> {};
+
+  @VisibleForTesting
+  static void setBeforeCommitRequests(BiConsumer<String, Long> hook) {
+    beforeCommitRequests = hook;
+  }
+
+  @VisibleForTesting
+  static void setBeforeCommitAttempt(BiConsumer<String, Long> hook) {
+    beforeCommitAttempt = hook;
+  }
 
   DynamicCommitter(
       Catalog catalog,
@@ -201,6 +216,7 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
         NavigableMap<Long, List<CommitRequest<DynamicCommittable>>> uncommitted =
             jobEntry.getValue().tailMap(maxCommittedCheckpointId, false);
         if (!uncommitted.isEmpty()) {
+          beforeCommitRequests.accept(tableKey.tableName(), uncommitted.lastKey());
           commitPendingRequests(
               table,
               tableKey.branch(),
@@ -466,6 +482,7 @@ class DynamicCommitter implements Committer<DynamicCommittable> {
     operation.toBranch(branch);
     operation.validateWith(new MaxCommittedCheckpointIdValidator(checkpointId, sinkId, operatorId));
 
+    beforeCommitAttempt.accept(table.name(), checkpointId);
     long startNano = System.nanoTime();
     try {
       operation.commit(); // abort is automatically called if this fails.
