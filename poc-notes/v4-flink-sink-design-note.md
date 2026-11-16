@@ -1343,11 +1343,3 @@ The proposed fix, in order:
 - DeleteOrphanFiles and partial rewrites with index-dv.
 - Profiling of D's write cost.
 
----
-**AI Disclosure (iteration 4)**
-- Model: Claude (Anthropic)
-- Platform/Tool: Kiro (Kiro Crew)
-- Human Oversight: partially reviewed
-- Prompt Summary: Run six failure scenarios and a 10M-key resource comparison across append, eq-delete upsert, the
-  eq → DV converter and index-dv, find D's root cause, propose a fix, implement its fail-fast step and an opt-in rebuild, and test both against compactions and concurrent rewrites. The harnesses, measurements, analysis and
-  this section are generated.
